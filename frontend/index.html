@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>Babel — Live Translator</title>
+
+<link rel="manifest" href="manifest.webmanifest" />
+<link rel="apple-touch-icon" href="icons/icon-180.png" />
+<meta name="theme-color" content="#0f1115" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Babel" />
+<meta name="mobile-web-app-capable" content="yes" />
+
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e8ec;
+    --muted: #8a90a0;
+    --accent: #4f8cff;
+    --accent-dim: #2c4a85;
+    --danger: #ff5c5c;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    height: 100%;
+    overscroll-behavior-y: contain;
+  }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: calc(0.85rem + env(safe-area-inset-top)) 1rem 0.75rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    flex-shrink: 0;
+  }
+  header h1 {
+    font-size: 1.1rem;
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  header h1 span { color: var(--accent); }
+  .header-right { display: flex; align-items: center; gap: 0.5rem; }
+  #status {
+    font-size: 0.75rem;
+    color: var(--muted);
+    padding: 0.3rem 0.6rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .icon-btn {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 999px;
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  #errorBar {
+    display: none;
+    background: rgba(255, 92, 92, 0.12);
+    color: var(--danger);
+    font-size: 0.8rem;
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+  #errorBar.visible { display: block; }
+
+  #languagePicker {
+    display: none;
+    gap: 0.4rem;
+    padding: 0.6rem 1rem;
+    overflow-x: auto;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  #languagePicker.visible { display: flex; }
+  .picker-chip {
+    flex-shrink: 0;
+    font-family: inherit;
+    font-size: 0.82rem;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 999px;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+  }
+  .picker-chip.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #06101f;
+    font-weight: 600;
+  }
+
+  main {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .bubble {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 0.7rem 0.9rem;
+    max-width: 640px;
+  }
+  .bubble-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.3rem;
+    min-height: 1.1rem;
+  }
+  .speaker-tag {
+    font-size: 0.68rem;
+    font-weight: 700;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    color: var(--speaker-color, var(--accent));
+    background: color-mix(in srgb, var(--speaker-color, var(--accent)) 18%, transparent);
+  }
+  .lang-tag {
+    font-size: 0.68rem;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+  .bubble-source {
+    font-size: 1.02rem;
+    line-height: 1.5;
+  }
+  .bubble-translation {
+    font-size: 1.02rem;
+    line-height: 1.5;
+    color: var(--accent);
+    margin-top: 0.3rem;
+    font-style: italic;
+  }
+  .bubble-translation:empty::before {
+    content: "translating…";
+    color: var(--muted);
+    font-size: 0.85rem;
+    font-style: normal;
+  }
+  .bubble-translation:empty.pending::before { content: "translating…"; }
+
+  #interimRow {
+    color: var(--muted);
+    font-style: italic;
+    padding: 0 0.2rem;
+    min-height: 1.4rem;
+  }
+
+  footer {
+    padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  #toggleBtn {
+    width: 100%;
+    font-family: inherit;
+    font-size: 1rem;
+    font-weight: 600;
+    border-radius: 10px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #06101f;
+    padding: 0.85rem;
+    cursor: pointer;
+  }
+  #toggleBtn.listening {
+    background: transparent;
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  #toggleBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Settings overlay */
+  #settingsOverlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 20;
+    align-items: flex-end;
+  }
+  #settingsOverlay.visible { display: flex; }
+  #settingsPanel {
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    border-radius: 16px 16px 0 0;
+    width: 100%;
+    max-height: 85vh;
+    overflow-y: auto;
+    padding: 1.25rem 1.25rem calc(1.25rem + env(safe-area-inset-bottom));
+  }
+  #settingsPanel h2 {
+    margin: 0 0 1rem;
+    font-size: 1.05rem;
+  }
+  .settings-section { margin-bottom: 1.25rem; }
+  .settings-section label.field-label {
+    display: block;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    margin-bottom: 0.4rem;
+  }
+  .settings-section p.hint {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin: 0.4rem 0 0;
+    line-height: 1.4;
+  }
+  #settingsPanel input[type="text"], #settingsPanel select {
+    width: 100%;
+    font-family: inherit;
+    font-size: 0.95rem;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    padding: 0.6rem 0.7rem;
+  }
+  .lang-checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .lang-check {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.35rem 0.7rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .lang-check input { margin: 0; }
+  .lang-check-tag {
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    border-radius: 999px;
+    padding: 0.05rem 0.4rem;
+  }
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  #settingsDoneBtn {
+    width: 100%;
+    font-family: inherit;
+    font-size: 0.95rem;
+    font-weight: 600;
+    border-radius: 10px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: #06101f;
+    padding: 0.7rem;
+    cursor: pointer;
+    margin-top: 0.5rem;
+  }
+
+  #installBanner {
+    display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 0.6rem 1rem;
+    font-size: 0.8rem;
+  }
+  #installBanner.visible { display: flex; }
+  #installBanner button {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 1rem;
+    cursor: pointer;
+    padding: 0 0.3rem;
+  }
+</style>
+</head>
+<body>
+
+<div id="installBanner">
+  <span>Add Babel to your Home Screen: tap <strong>Share</strong> → <strong>Add to Home Screen</strong>.</span>
+  <button id="dismissInstallBtn" aria-label="Dismiss">✕</button>
+</div>
+
+<header>
+  <h1><span>Babel</span> Live Translator</h1>
+  <div class="header-right">
+    <span id="status">idle</span>
+    <button id="settingsBtn" class="icon-btn" aria-label="Settings">⚙</button>
+  </div>
+</header>
+
+<div id="errorBar"></div>
+
+<div id="languagePicker"></div>
+
+<main id="feed">
+  <div id="interimRow"></div>
+</main>
+
+<footer>
+  <button id="toggleBtn">Start Listening</button>
+</footer>
+
+<div id="settingsOverlay">
+  <div id="settingsPanel">
+    <h2>Settings</h2>
+
+    <div class="settings-section">
+      <label class="field-label" for="backendInput">Backend</label>
+      <input id="backendInput" type="text" placeholder="same origin (leave blank), or e.g. http://192.168.1.23:8000" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+      <p class="hint">Leave blank to use this page's own host. Only needed if the frontend and backend are served from different addresses.</p>
+    </div>
+
+    <div class="settings-section">
+      <label class="field-label" for="targetSelect">Translate into</label>
+      <select id="targetSelect"></select>
+    </div>
+
+    <div class="settings-section">
+      <span class="field-label">Spoken languages</span>
+      <div id="langChecks" class="lang-checks"></div>
+      <p class="hint">Select every language you expect to hear. If every language you pick is tagged "auto", Babel switches between them automatically as speakers change languages (Deepgram's native code-switching — reliable because it listens for all of them at once, not by guessing from already-transcribed text). If any pick isn't tagged "auto", automatic switching isn't reliable for that combination — you'll get a manual language-picker in the transcript view instead.</p>
+    </div>
+
+    <div class="settings-section">
+      <div class="toggle-row">
+        <div>
+          <span class="field-label" style="margin-bottom:0.1rem;">Speaker separation</span>
+          <p class="hint" style="margin-top:0.15rem;">Labels who's speaking. Needs the backend's diarization setup (HUGGINGFACE_TOKEN + diart) — leave off if you haven't configured that yet.</p>
+        </div>
+        <input id="diarizationToggle" type="checkbox" />
+      </div>
+    </div>
+
+    <button id="settingsDoneBtn">Done</button>
+  </div>
+</div>
+
+<script>
+(() => {
+  const SAMPLE_RATE_TARGET = 16000;
+  const CHUNK_SECONDS = 0.05; // ~50ms of audio per outgoing message
+
+  const LANGUAGES = [
+    { code: "en", name: "English" },
+    { code: "es", name: "Spanish" },
+    { code: "fr", name: "French" },
+    { code: "de", name: "German" },
+    { code: "zh", name: "Mandarin Chinese" },
+    { code: "ja", name: "Japanese" },
+    { code: "ko", name: "Korean" },
+    { code: "pt", name: "Portuguese" },
+    { code: "hi", name: "Hindi" },
+    { code: "ar", name: "Arabic" },
+    { code: "tr", name: "Turkish" },
+    { code: "tl", name: "Tagalog" },
+    { code: "ta", name: "Tamil" },
+  ];
+  const languageName = (code) => LANGUAGES.find((l) => l.code === code)?.name ?? code;
+
+  // Mirrors backend/app/main.py's MULTI_MODE_LANGUAGES: the set Deepgram's
+  // native `language=multi` code-switching mode actually covers. Selecting
+  // 2+ spoken languages that are ALL in this set gets automatic switching;
+  // anything else (any outlier language involved) falls back to the manual
+  // picker, since there's no reliable way to auto-detect switches Deepgram
+  // itself doesn't natively support (see backend/README.md for why).
+  const MULTI_MODE_LANGUAGES = new Set(["en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"]);
+
+  // ---- AudioWorkletProcessor source, loaded into the audio thread via a
+  // Blob URL. Downsamples by simple stride decimation (no anti-aliasing
+  // filter) and converts Float32 samples to little-endian PCM16 -- good
+  // enough for speech STT, not intended for hi-fi audio. Unchanged from
+  // the original single-panel version of this file.
+  const WORKLET_CODE = `
+    class PCMDownsampler extends AudioWorkletProcessor {
+      constructor(options) {
+        super();
+        const opts = options.processorOptions || {};
+        this._targetSampleRate = opts.targetSampleRate || 16000;
+        this._ratio = sampleRate / this._targetSampleRate;
+        this._chunkSamples = Math.round(this._targetSampleRate * ${CHUNK_SECONDS});
+        this._buffer = [];
+      }
+      process(inputs) {
+        const input = inputs[0];
+        if (input && input[0]) {
+          const channelData = input[0];
+          for (let i = 0; i < channelData.length; i += this._ratio) {
+            const idx = Math.floor(i);
+            if (idx < channelData.length) this._buffer.push(channelData[idx]);
+          }
+          while (this._buffer.length >= this._chunkSamples) {
+            const chunk = this._buffer.splice(0, this._chunkSamples);
+            const pcm16 = new Int16Array(chunk.length);
+            for (let j = 0; j < chunk.length; j++) {
+              const s = Math.max(-1, Math.min(1, chunk[j]));
+              pcm16[j] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+          }
+        }
+        return true;
+      }
+    }
+    registerProcessor('pcm-downsampler', PCMDownsampler);
+  `;
+
+  // ---------------------------------------------------------------------
+  // Settings (persisted to localStorage)
+  // ---------------------------------------------------------------------
+  const SETTINGS_KEY = "babel.settings";
+  const DEFAULT_SETTINGS = {
+    backendOrigin: "",
+    targetLanguage: "English",
+    spokenLanguages: ["en"],
+    diarizationEnabled: false,
+  };
+
+  function loadSettings() {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    } catch {}
+    return { ...DEFAULT_SETTINGS };
+  }
+  function saveSettings() {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }
+  let settings = loadSettings();
+
+  function wsBase() {
+    const origin = settings.backendOrigin.trim();
+    if (origin) {
+      if (origin.startsWith("ws://") || origin.startsWith("wss://")) return origin.replace(/\/$/, "");
+      if (origin.startsWith("https://")) return "wss://" + origin.slice(8).replace(/\/$/, "");
+      if (origin.startsWith("http://")) return "ws://" + origin.slice(7).replace(/\/$/, "");
+      return `ws://${origin}`.replace(/\/$/, "");
+    }
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${location.host}`;
+  }
+  function streamUrl() {
+    const langs = settings.spokenLanguages.length ? settings.spokenLanguages : [DEFAULT_SETTINGS.spokenLanguages[0]];
+    return `${wsBase()}/ws/stream?lang=${encodeURIComponent(settings.targetLanguage)}&source_langs=${encodeURIComponent(langs.join(","))}`;
+  }
+  function diarizeUrl() {
+    return `${wsBase()}/ws/diarize`;
+  }
+
+  // ---------------------------------------------------------------------
+  // DOM refs
+  // ---------------------------------------------------------------------
+  const statusEl = document.getElementById("status");
+  const errorBar = document.getElementById("errorBar");
+  const feedEl = document.getElementById("feed");
+  const interimRow = document.getElementById("interimRow");
+  const languagePicker = document.getElementById("languagePicker");
+  const toggleBtn = document.getElementById("toggleBtn");
+  const settingsBtn = document.getElementById("settingsBtn");
+  const settingsOverlay = document.getElementById("settingsOverlay");
+  const settingsDoneBtn = document.getElementById("settingsDoneBtn");
+  const backendInput = document.getElementById("backendInput");
+  const targetSelect = document.getElementById("targetSelect");
+  const langChecks = document.getElementById("langChecks");
+  const diarizationToggle = document.getElementById("diarizationToggle");
+  const installBanner = document.getElementById("installBanner");
+  const dismissInstallBtn = document.getElementById("dismissInstallBtn");
+
+  function setStatus(text) { statusEl.textContent = text; }
+  function showError(text) {
+    errorBar.textContent = text;
+    errorBar.classList.add("visible");
+  }
+  function clearError() {
+    errorBar.classList.remove("visible");
+    errorBar.textContent = "";
+  }
+  function scrollToBottom() { feedEl.scrollTop = feedEl.scrollHeight; }
+
+  // ---------------------------------------------------------------------
+  // Settings panel wiring
+  // ---------------------------------------------------------------------
+  function populateSettingsForm() {
+    backendInput.value = settings.backendOrigin;
+    targetSelect.innerHTML = "";
+    for (const lang of LANGUAGES) {
+      const opt = document.createElement("option");
+      opt.value = lang.name;
+      opt.textContent = lang.name;
+      if (lang.name === settings.targetLanguage) opt.selected = true;
+      targetSelect.appendChild(opt);
+    }
+    langChecks.innerHTML = "";
+    for (const lang of LANGUAGES) {
+      const label = document.createElement("label");
+      label.className = "lang-check";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.value = lang.code;
+      input.checked = settings.spokenLanguages.includes(lang.code);
+      input.addEventListener("change", () => {
+        const checked = [...langChecks.querySelectorAll("input:checked")].map((i) => i.value);
+        settings.spokenLanguages = checked.length ? checked : [lang.code]; // always keep at least one
+        if (!checked.length) input.checked = true;
+        saveSettings();
+      });
+      label.append(input, document.createTextNode(lang.name));
+      if (MULTI_MODE_LANGUAGES.has(lang.code)) {
+        const tag = document.createElement("span");
+        tag.className = "lang-check-tag";
+        tag.textContent = "auto";
+        label.appendChild(tag);
+      }
+      langChecks.appendChild(label);
+    }
+    diarizationToggle.checked = settings.diarizationEnabled;
+  }
+
+  settingsBtn.addEventListener("click", () => {
+    populateSettingsForm();
+    settingsOverlay.classList.add("visible");
+  });
+  settingsDoneBtn.addEventListener("click", () => settingsOverlay.classList.remove("visible"));
+  settingsOverlay.addEventListener("click", (e) => {
+    if (e.target === settingsOverlay) settingsOverlay.classList.remove("visible");
+  });
+  backendInput.addEventListener("change", () => { settings.backendOrigin = backendInput.value; saveSettings(); });
+  targetSelect.addEventListener("change", () => { settings.targetLanguage = targetSelect.value; saveSettings(); });
+  diarizationToggle.addEventListener("change", () => { settings.diarizationEnabled = diarizationToggle.checked; saveSettings(); });
+
+  // ---------------------------------------------------------------------
+  // Conversation state + rendering
+  // ---------------------------------------------------------------------
+  let turns = [];           // [{id, speakerLabel, sourceText, sourceLocale, translatedText, isFinal, isTranslationFinal, timestamp}]
+  let speakerTurns = [];    // [{speaker, start, end}]
+  const turnElements = new Map();
+  let interimText = "";
+  let interimLanguage = null;
+  let currentLanguage = null;
+  let sessionStartMs = 0;
+  let multiMode = false;
+  let pickerCandidateLangs = []; // this session's spoken-language list, captured at connect time
+
+  // Shown only for sessions where multi_mode is false and 2+ languages were
+  // selected -- i.e. the candidate set includes something outside
+  // MULTI_MODE_LANGUAGES, so Deepgram can't auto-switch reliably (see the
+  // comment on MULTI_MODE_LANGUAGES above). Tapping a chip sends a
+  // switch_language control message; the active chip updates once the
+  // backend confirms via a "language_switched" status message, not
+  // optimistically, since the switch briefly reconnects Deepgram server-side.
+  function renderLanguagePicker() {
+    const shouldShow = !multiMode && pickerCandidateLangs.length > 1;
+    languagePicker.classList.toggle("visible", shouldShow);
+    if (!shouldShow) {
+      languagePicker.innerHTML = "";
+      return;
+    }
+    languagePicker.innerHTML = "";
+    for (const code of pickerCandidateLangs) {
+      const chip = document.createElement("button");
+      chip.className = "picker-chip" + (code === currentLanguage ? " active" : "");
+      chip.textContent = languageName(code);
+      chip.addEventListener("click", () => sendSwitchLanguage(code));
+      languagePicker.appendChild(chip);
+    }
+  }
+
+  function sendSwitchLanguage(code) {
+    if (code === currentLanguage) return;
+    if (streamWs && streamWs.readyState === WebSocket.OPEN) {
+      streamWs.send(JSON.stringify({ type: "switch_language", language: code }));
+    }
+  }
+
+  function colorForSpeaker(speaker) {
+    let hash = 0;
+    for (let i = 0; i < speaker.length; i++) hash = (hash * 31 + speaker.charCodeAt(i)) >>> 0;
+    return `hsl(${hash % 360}, 55%, 62%)`;
+  }
+
+  function renderInterim() {
+    if (!interimText) {
+      interimRow.textContent = "";
+      return;
+    }
+    const tag = interimLanguage ? `[${interimLanguage.toUpperCase()}] ` : "";
+    interimRow.textContent = tag + interimText;
+    scrollToBottom();
+  }
+
+  function renderTurn(turn) {
+    let refs = turnElements.get(turn.id);
+    if (!refs) {
+      const el = document.createElement("div");
+      el.className = "bubble";
+      const meta = document.createElement("div");
+      meta.className = "bubble-meta";
+      const speakerEl = document.createElement("span");
+      speakerEl.className = "speaker-tag";
+      speakerEl.style.display = "none";
+      const langEl = document.createElement("span");
+      langEl.className = "lang-tag";
+      meta.append(speakerEl, langEl);
+      const sourceEl = document.createElement("div");
+      sourceEl.className = "bubble-source";
+      const translationEl = document.createElement("div");
+      translationEl.className = "bubble-translation";
+      el.append(meta, sourceEl, translationEl);
+      feedEl.insertBefore(el, interimRow);
+      refs = { el, speakerEl, langEl, sourceEl, translationEl };
+      turnElements.set(turn.id, refs);
+    }
+
+    refs.sourceEl.textContent = turn.sourceText;
+    refs.translationEl.textContent = turn.translatedText;
+    refs.translationEl.classList.toggle("pending", turn.isFinal && !turn.translatedText);
+    refs.langEl.textContent = turn.sourceLocale ? turn.sourceLocale.toUpperCase() : "";
+    if (turn.speakerLabel) {
+      refs.speakerEl.textContent = turn.speakerLabel;
+      refs.speakerEl.style.display = "";
+      refs.speakerEl.style.setProperty("--speaker-color", colorForSpeaker(turn.speakerLabel));
+    } else {
+      refs.speakerEl.style.display = "none";
+    }
+    scrollToBottom();
+  }
+
+  function upsertTurn(id, text, language, timestamp, isFinal) {
+    let turn = turns.find((t) => t.id === id);
+    if (turn) {
+      turn.sourceText = text;
+      turn.isFinal = isFinal;
+    } else {
+      turn = {
+        id, speakerLabel: null, sourceText: text, sourceLocale: language,
+        translatedText: "", isFinal, isTranslationFinal: false, timestamp,
+      };
+      turns.push(turn);
+    }
+    applySpeakerLabels();
+    renderTurn(turn);
+    return turn;
+  }
+
+  function applyTranslationDelta(segmentId, delta, isFinal) {
+    const turn = turns.find((t) => t.id === segmentId);
+    if (!turn) return;
+    turn.translatedText += delta;
+    if (isFinal) turn.isTranslationFinal = true;
+    renderTurn(turn);
+  }
+
+  // Diarization resolves ~5s analysis windows behind the audio (diart's
+  // window), so this re-runs on every new SpeakerTurn or transcript turn.
+  // Point-based matching (contains, then nearest-within-2s) is an
+  // approximation -- exact alignment isn't attempted since diart's own
+  // ~500ms window shift already bounds the achievable precision. See
+  // ios/Babel/Session/ConversationSession.swift for the same logic ported
+  // from Swift, and ios/README.md for the expected-behavior notes.
+  function applySpeakerLabels() {
+    for (const turn of turns) {
+      if (turn.speakerLabel) continue;
+      const t = turn.timestamp;
+      let match = speakerTurns.find((st) => t >= st.start && t <= st.end);
+      if (!match && speakerTurns.length) {
+        let nearest = null, nearestDist = Infinity;
+        for (const st of speakerTurns) {
+          const dist = Math.abs((st.start + st.end) / 2 - t);
+          if (dist < nearestDist) { nearestDist = dist; nearest = st; }
+        }
+        if (nearest && nearestDist < 2.0) match = nearest;
+      }
+      if (match) {
+        turn.speakerLabel = match.speaker;
+        renderTurn(turn);
+      }
+    }
+  }
+
+  function resetConversation() {
+    turns = [];
+    speakerTurns = [];
+    turnElements.clear();
+    interimText = "";
+    interimLanguage = null;
+    multiMode = false;
+    pickerCandidateLangs = [];
+    feedEl.querySelectorAll(".bubble").forEach((el) => el.remove());
+    renderInterim();
+    renderLanguagePicker();
+  }
+
+  // ---------------------------------------------------------------------
+  // WebSocket message handling
+  // ---------------------------------------------------------------------
+  function handleStreamMessage(event) {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+
+    switch (msg.type) {
+      case "transcript": {
+        const elapsed = (Date.now() - sessionStartMs) / 1000;
+        if (!msg.is_final) {
+          interimText = msg.data;
+          interimLanguage = msg.language;
+          renderInterim();
+        } else {
+          interimText = "";
+          interimLanguage = null;
+          renderInterim();
+          upsertTurn(msg.segment_id, msg.data, msg.language, elapsed, true);
+        }
+        return;
+      }
+      case "translation":
+        applyTranslationDelta(msg.segment_id, msg.data, msg.final);
+        return;
+      case "status":
+        if (msg.data === "connected") {
+          multiMode = !!msg.multi_mode;
+          currentLanguage = msg.language || currentLanguage;
+          pickerCandidateLangs = [...settings.spokenLanguages];
+          renderLanguagePicker();
+          setStatus(multiMode ? "listening (auto language-switch)" : "listening");
+        } else if (msg.data === "language_switched" && msg.language) {
+          currentLanguage = msg.language;
+          renderLanguagePicker();
+          setStatus(`listening — switched to ${languageName(msg.language)}`);
+        } else {
+          setStatus(msg.data);
+        }
+        return;
+      case "error":
+        setStatus("error");
+        showError(msg.data);
+        return;
+    }
+  }
+
+  function handleDiarizeMessage(event) {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+    if (msg.type === "speaker_turn") {
+      speakerTurns.push({ speaker: msg.speaker, start: msg.start, end: msg.end });
+      applySpeakerLabels();
+    } else if (msg.type === "error") {
+      showError(`Speaker separation: ${msg.data}`);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Wake Lock (keep the screen on during a live conversation)
+  // ---------------------------------------------------------------------
+  let wakeLock = null;
+  async function requestWakeLock() {
+    if (!("wakeLock" in navigator)) return;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    } catch (err) {
+      console.warn("Wake lock request failed:", err);
+    }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (isListening && document.visibilityState === "visible" && !wakeLock) requestWakeLock();
+  });
+
+  // ---------------------------------------------------------------------
+  // Audio capture + WebSocket lifecycle
+  // ---------------------------------------------------------------------
+  let audioContext, mediaStream, sourceNode, workletNode, scriptNode;
+  let streamWs, diarizeWs;
+  let isListening = false;
+
+  function sendAudioChunk(buffer) {
+    if (streamWs && streamWs.readyState === WebSocket.OPEN) streamWs.send(buffer);
+    if (diarizeWs && diarizeWs.readyState === WebSocket.OPEN) diarizeWs.send(buffer);
+  }
+
+  async function startScriptProcessorFallback() {
+    const ratio = audioContext.sampleRate / SAMPLE_RATE_TARGET;
+    scriptNode = audioContext.createScriptProcessor(4096, 1, 1);
+    scriptNode.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      const outLength = Math.floor(input.length / ratio);
+      const pcm16 = new Int16Array(outLength);
+      for (let i = 0; i < outLength; i++) {
+        const s = Math.max(-1, Math.min(1, input[Math.floor(i * ratio)]));
+        pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      sendAudioChunk(pcm16.buffer);
+    };
+    sourceNode.connect(scriptNode);
+    // Chrome/Safari only fire onaudioprocess while the node is in an active
+    // graph; output is left untouched (silent), so this does not create feedback.
+    scriptNode.connect(audioContext.destination);
+  }
+
+  function openSocket(url) {
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    return ws;
+  }
+
+  async function startListening() {
+    if (isListening) return;
+    toggleBtn.disabled = true;
+    clearError();
+    setStatus("connecting…");
+    resetConversation();
+    currentLanguage = settings.spokenLanguages[0] || DEFAULT_SETTINGS.spokenLanguages[0];
+
+    streamWs = openSocket(streamUrl());
+    const opened = await new Promise((resolve) => {
+      streamWs.addEventListener("open", () => resolve(true), { once: true });
+      streamWs.addEventListener("error", () => resolve(false), { once: true });
+    });
+    if (!opened) {
+      setStatus("connection failed");
+      toggleBtn.disabled = false;
+      return;
+    }
+    streamWs.onmessage = handleStreamMessage;
+    streamWs.onclose = () => { if (isListening) stopListening(); };
+
+    if (settings.diarizationEnabled) {
+      diarizeWs = openSocket(diarizeUrl());
+      diarizeWs.onmessage = handleDiarizeMessage;
+      diarizeWs.onerror = () => showError("Could not connect to the diarization backend.");
+    }
+
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+    } catch (err) {
+      setStatus("mic access denied");
+      streamWs.close();
+      diarizeWs?.close();
+      toggleBtn.disabled = false;
+      return;
+    }
+
+    sessionStartMs = Date.now();
+    await requestWakeLock();
+
+    audioContext = new AudioContext();
+    sourceNode = audioContext.createMediaStreamSource(mediaStream);
+
+    if (audioContext.audioWorklet) {
+      try {
+        const blobUrl = URL.createObjectURL(new Blob([WORKLET_CODE], { type: "application/javascript" }));
+        await audioContext.audioWorklet.addModule(blobUrl);
+        workletNode = new AudioWorkletNode(audioContext, "pcm-downsampler", {
+          processorOptions: { targetSampleRate: SAMPLE_RATE_TARGET },
+        });
+        workletNode.port.onmessage = (e) => sendAudioChunk(e.data);
+        sourceNode.connect(workletNode);
+      } catch (err) {
+        console.warn("AudioWorklet unavailable, falling back to ScriptProcessor:", err);
+        await startScriptProcessorFallback();
+      }
+    } else {
+      await startScriptProcessorFallback();
+    }
+
+    isListening = true;
+    toggleBtn.disabled = false;
+    toggleBtn.textContent = "Stop Listening";
+    toggleBtn.classList.add("listening");
+    // No setStatus() here -- the server's "connected" status message (see
+    // handleStreamMessage) already set a more specific one (whether this
+    // session auto-switches languages or not), and typically arrives before
+    // this point anyway given how long getUserMedia + audio setup takes.
+  }
+
+  function stopListening() {
+    isListening = false;
+    cleanupAudio();
+    releaseWakeLock();
+    if (streamWs && streamWs.readyState === WebSocket.OPEN) streamWs.close();
+    if (diarizeWs && diarizeWs.readyState === WebSocket.OPEN) diarizeWs.close();
+    streamWs = null;
+    diarizeWs = null;
+    toggleBtn.disabled = false;
+    toggleBtn.textContent = "Start Listening";
+    toggleBtn.classList.remove("listening");
+    setStatus("stopped");
+    multiMode = false;
+    pickerCandidateLangs = [];
+    renderLanguagePicker();
+  }
+
+  function cleanupAudio() {
+    if (workletNode) { try { workletNode.disconnect(); } catch {} workletNode = null; }
+    if (scriptNode) { try { scriptNode.disconnect(); } catch {} scriptNode = null; }
+    if (sourceNode) { try { sourceNode.disconnect(); } catch {} sourceNode = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
+    if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; }
+  }
+
+  toggleBtn.addEventListener("click", () => {
+    if (isListening) stopListening();
+    else startListening();
+  });
+
+  // ---------------------------------------------------------------------
+  // iOS "Add to Home Screen" banner (Safari has no beforeinstallprompt)
+  // ---------------------------------------------------------------------
+  function isIosSafariInstallCandidate() {
+    const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const isStandalone = window.navigator.standalone === true || window.matchMedia("(display-mode: standalone)").matches;
+    return isIos && !isStandalone;
+  }
+  if (isIosSafariInstallCandidate() && !localStorage.getItem("babel.installBannerDismissed")) {
+    installBanner.classList.add("visible");
+  }
+  dismissInstallBtn.addEventListener("click", () => {
+    installBanner.classList.remove("visible");
+    localStorage.setItem("babel.installBannerDismissed", "1");
+  });
+
+  // ---------------------------------------------------------------------
+  // Service worker registration
+  // ---------------------------------------------------------------------
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", () => {
+      navigator.serviceWorker.register("sw.js").catch((err) => console.warn("SW registration failed:", err));
+    });
+  }
+})();
+</script>
+</body>
+</html>
