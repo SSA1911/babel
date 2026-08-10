@@ -5,43 +5,12 @@ groq>=0.11,<1.0
 pydantic-settings>=2.4,<3.0
 python-dotenv>=1.0,<2.0
 
-# /ws/diarize (speaker diarization). Heavy, optional at import time (see
-# app/diarization.py) -- the rest of the backend works without them, but
-# diarization will report itself unavailable until these are installed.
+# Speaker diarization is handled by Deepgram's own streaming diarizer
+# (diarize=true on the STT connection -- see app/deepgram_client.py), which
+# labels every word in the same result that carries the transcript.
 #
-# IMPORTANT: requires Python <=3.12. diart pins numpy<2.0, and numpy stopped
-# publishing prebuilt Windows/most-platform wheels for the 1.x line before
-# Python 3.13 existed, so installing this on 3.13 tries to compile numpy
-# from source and fails without a C compiler. Use `py -3.12 -m venv .venv`.
-#
-# torch/torchaudio/torchvision are pinned (rather than left open per
-# diart's own >=2.2 constraint) because newer torchaudio releases removed
-# `torchaudio.AudioMetaData`, which pyannote.audio 3.4.0 still imports --
-# pip's resolver will happily install an incompatible newer torch otherwise.
-diart>=0.9,<1.0
-torch==2.2.2
-torchaudio==2.2.2
-torchvision==0.17.2
-
-# pyannote.core's notebook module imports matplotlib.cm.get_cmap, removed in
-# matplotlib 3.9.
-matplotlib<3.9
-
-# pyannote.audio 3.4.0 still calls hf_hub_download(..., use_auth_token=...),
-# a kwarg huggingface_hub's 1.x line removed outright (not just deprecated).
-# NOTE: do not `pip install transformers` in this environment -- its latest
-# releases require huggingface_hub>=1.5, directly conflicting with this pin.
-# It isn't a real dependency of anything here; see the docstring on
-# _patch_speechbrain_windows_lazy_import_bug() in app/diarization.py for why
-# it can seem like one.
-huggingface_hub<1.0
-
-# speechbrain (pulled in by pyannote.audio) has a lazy-import guard that's
-# supposed to prevent pytorch_lightning's inspect.stack()-based JIT check
-# from incidentally trying to import speechbrain's optional integrations
-# (k2, transformers, ...), but the guard's path check is Unix-only and never
-# fires on Windows. app/diarization.py monkeypatches this at runtime
-# (_patch_speechbrain_windows_lazy_import_bug), so no extra packages or
-# version pin are needed here for this specific issue -- noted so a future
-# `pip install k2` / `pip install transformers` "fix" attempt (which does NOT
-# work, see above) isn't tried again.
+# This replaced a diart/pyannote sidecar that pulled in torch, torchaudio,
+# torchvision, matplotlib and a pinned huggingface_hub. Removing it also
+# removed diart's numpy<2.0 pin, which was the only reason this project
+# required Python <=3.12 -- any modern Python works now, and installs take
+# seconds rather than downloading a multi-gigabyte torch wheel.

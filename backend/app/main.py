@@ -4,6 +4,8 @@ import asyncio
 import itertools
 import json
 import logging
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -13,40 +15,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from .config import settings
-from .deepgram_client import DeepgramLiveClient
-from .diarization import DiarizationUnavailable, StreamingDiarizer
 from .schemas import TranslateRequest
-from .translator import stream_translation
+from .stt_session import (
+    SUPPORTED_SOURCE_LANGUAGES,
+    MultiLanguageSTT,
+    TranscriptEvent,
+    plan_connections,
+)
+from .translator import pick_model, stream_translation
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("babel.main")
-
-# Deepgram's live API has no auto-detection for a single-language connection,
-# so the source language must be picked explicitly and validated (it flows
-# into an outbound API call). Nova-3 language codes; see
-# https://developers.deepgram.com/docs/models-languages-overview (checked
-# 2026-08). Malayalam ("ml") is deliberately excluded -- confirmed absent
-# from Deepgram's supported list for both Nova-2 and Nova-3. "tl" (Tagalog)
-# similarly isn't documented but does work in practice.
-SUPPORTED_SOURCE_LANGUAGES = {
-    "en", "es", "fr", "de", "zh", "ja", "ko", "pt", "hi", "ar", "tr", "tl", "ta",
-}
-
-# Deepgram's live `language=multi` mode transcribes multiple languages
-# within one stream without needing to know in advance which one is coming
-# (see https://developers.deepgram.com/docs/multilingual-code-switching,
-# checked 2026-08) -- but it only covers this fixed set for Nova-3. Earlier
-# attempts at auto-switching by reconnecting Deepgram based on langid-ing
-# its own output text were unreliable: if the wrong-language connection is
-# still active when a speaker switches, it transcribes the new language
-# using the old one's model, producing garbled text that still reads as the
-# old language to a text classifier -- the switch can never be detected.
-# Native multi mode doesn't have this chicken-and-egg problem since Deepgram
-# itself listens for all covered languages simultaneously. For anything
-# outside this set (Arabic, Turkish, Tagalog, Tamil, ...), there's no
-# reliable automatic option, so the client should offer a manual language
-# picker instead (see the "switch_language" control message below).
-MULTI_MODE_LANGUAGES = {"en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"}
 
 app = FastAPI(title="Babel Live Translator")
 
@@ -69,16 +48,35 @@ async def health():
 
 
 def _parse_candidate_languages(client_ws: WebSocket) -> list[str]:
-    """Reads ?source_langs=en,es (new, multi-candidate) or falls back to the
+    """Reads ?source_langs=en,ar,tl (multi-candidate) or falls back to the
     older single ?source_lang=en for backward compatibility."""
     multi = client_ws.query_params.get("source_langs")
     if multi:
-        candidates = [c.strip() for c in multi.split(",") if c.strip() in SUPPORTED_SOURCE_LANGUAGES]
+        candidates = [
+            c.strip() for c in multi.split(",") if c.strip() in SUPPORTED_SOURCE_LANGUAGES
+        ]
         if candidates:
             return candidates
 
     single = client_ws.query_params.get("source_lang", settings.source_language)
     return [single if single in SUPPORTED_SOURCE_LANGUAGES else settings.source_language]
+
+
+@dataclass
+class _Segment:
+    """One utterance in flight through translation.
+
+    Translations run concurrently, but each writes into its own queue and a
+    single emitter drains them in segment order -- so a slow response for
+    segment 1 can no longer delay segment 2 *starting*, while the guarantee
+    that translations render in the order they were spoken is preserved.
+    """
+
+    segment_id: int
+    deltas: "asyncio.Queue[str | None]" = field(default_factory=asyncio.Queue)
+    fused: bool = False
+    t_final: float = 0.0
+    t_first_token: Optional[float] = None
 
 
 @app.websocket("/ws/stream")
@@ -87,123 +85,161 @@ async def stream_endpoint(client_ws: WebSocket):
 
     target_language = client_ws.query_params.get("lang", settings.target_language)
     candidate_langs = _parse_candidate_languages(client_ws)
-    current_lang = candidate_langs[0]
+    model_mode = client_ws.query_params.get("model_mode")
+    fusion_enabled = client_ws.query_params.get("fusion", "1") != "0"
 
-    # Native code-switching only when every candidate is in Deepgram's
-    # covered set (see MULTI_MODE_LANGUAGES above); otherwise this session
-    # has no automatic switching and relies on the client sending explicit
-    # "switch_language" control messages (e.g. from a manual picker in the UI).
-    uses_multi_mode = len(candidate_langs) > 1 and all(lang in MULTI_MODE_LANGUAGES for lang in candidate_langs)
-    deepgram_language = "multi" if uses_multi_mode else current_lang
+    model = pick_model(candidate_langs, target_language, model_mode)
 
-    dg_client = DeepgramLiveClient(
-        settings.deepgram_api_key, model=settings.deepgram_stt_model, language=deepgram_language
+    plans, dropped = plan_connections(
+        candidate_langs,
+        baseline=settings.stt_connection_baseline,
+        ceiling=settings.stt_connection_ceiling,
+    )
+
+    stt = MultiLanguageSTT(
+        settings.deepgram_api_key,
+        model=settings.deepgram_stt_model,
+        plans=plans,
+        endpointing_ms=settings.endpointing_ms,
+        utterance_end_ms=settings.utterance_end_ms,
+        arbitration_grace_ms=settings.arbitration_grace_ms,
     )
     try:
-        await dg_client.connect()
+        await stt.start()
     except Exception as exc:
-        logger.exception("Failed to connect to Deepgram")
-        await _safe_send_json(client_ws, {"type": "error", "data": f"Could not connect to speech engine: {exc}"})
+        logger.exception("Failed to start STT session")
+        await _safe_send_json(
+            client_ws, {"type": "error", "data": f"Could not connect to speech engine: {exc}"}
+        )
         await _safe_close(client_ws)
         return
 
     await _safe_send_json(
         client_ws,
-        {"type": "status", "data": "connected", "multi_mode": uses_multi_mode, "language": current_lang},
+        {
+            "type": "status",
+            "data": "connected",
+            "languages": stt.auto_languages,
+            "manual_languages": dropped,
+            "connections": stt.connection_count,
+            "diarization": stt.diarization_enabled,
+            "model": model,
+        },
     )
 
     segment_ids = itertools.count(1)
-    translation_queue: "asyncio.Queue[tuple[int, str] | None]" = asyncio.Queue()
-    dg_lock = asyncio.Lock()
+    order_queue: "asyncio.Queue[_Segment | None]" = asyncio.Queue()
+    translation_slots = asyncio.Semaphore(settings.translation_concurrency)
     session_ended = asyncio.Event()
-    deepgram_reader_task: Optional[asyncio.Task] = None
 
-    async def run_deepgram_reader(client: DeepgramLiveClient) -> None:
-        """Reads transcript messages from one Deepgram connection. Cancelled
-        (not left to finish naturally) when switch_to_language() swaps in a
-        new connection; only an unexpected Deepgram-side failure ends the
-        session from here."""
-        nonlocal current_lang
+    async def translate_segment(segment: _Segment, text: str, alternate: Optional[str]) -> None:
         try:
-            async for message in client.messages():
-                alternatives = message.get("channel", {}).get("alternatives", [{}])
-                text = alternatives[0].get("transcript", "") if alternatives else ""
-                if not text:
+            async with translation_slots:
+                async for delta in stream_translation(
+                    text, target_language, model=model, alternate_text=alternate
+                ):
+                    if segment.t_first_token is None:
+                        segment.t_first_token = time.monotonic()
+                    await segment.deltas.put(delta)
+        except Exception as exc:
+            logger.exception("Translation failed for segment %s", segment.segment_id)
+            await _safe_send_json(
+                client_ws, {"type": "error", "data": f"Translation failed: {exc}"}
+            )
+        finally:
+            await segment.deltas.put(None)
+
+    async def emit_translations() -> None:
+        """Drains segment queues strictly in spoken order."""
+        while True:
+            segment = await order_queue.get()
+            if segment is None:
+                break
+            while True:
+                delta = await segment.deltas.get()
+                if delta is None:
+                    break
+                await _safe_send_json(
+                    client_ws,
+                    {
+                        "type": "translation",
+                        "segment_id": segment.segment_id,
+                        "data": delta,
+                        "final": False,
+                    },
+                )
+            now = time.monotonic()
+            ttft = (
+                int((segment.t_first_token - segment.t_final) * 1000)
+                if segment.t_first_token
+                else None
+            )
+            total = int((now - segment.t_final) * 1000)
+            logger.info(
+                "segment %s translated in %sms (first token %sms)%s",
+                segment.segment_id, total, ttft, " [fused]" if segment.fused else "",
+            )
+            await _safe_send_json(
+                client_ws,
+                {
+                    "type": "translation",
+                    "segment_id": segment.segment_id,
+                    "data": "",
+                    "final": True,
+                    "ms_to_first_token": ttft,
+                    "ms_total": total,
+                    "fused": segment.fused,
+                },
+            )
+
+    async def consume_transcripts() -> None:
+        try:
+            async for event in stt.events():
+                if not event.is_final:
+                    await _safe_send_json(
+                        client_ws,
+                        {
+                            "type": "transcript",
+                            "segment_id": -1,
+                            "data": event.text,
+                            "is_final": False,
+                            "language": event.language,
+                        },
+                    )
                     continue
 
-                is_final = bool(message.get("is_final", False))
-                seg_id = next(segment_ids) if is_final else -1
-
-                # In multi mode Deepgram reports the detected language per
-                # result (channel.alternatives[0].languages, a list of
-                # BCP-47 tags); otherwise it's whatever we're connected with.
-                if uses_multi_mode:
-                    detected = alternatives[0].get("languages") if alternatives else None
-                    segment_language = detected[0] if detected else current_lang
-                else:
-                    segment_language = current_lang
-
+                seg_id = next(segment_ids)
                 await _safe_send_json(
                     client_ws,
                     {
                         "type": "transcript",
                         "segment_id": seg_id,
-                        "data": text,
-                        "is_final": is_final,
-                        "language": segment_language,
+                        "data": event.text,
+                        "is_final": True,
+                        "language": event.language,
+                        "speaker": event.speaker,
+                        "word_languages": event.word_languages,
                     },
                 )
 
-                if is_final:
-                    await translation_queue.put((seg_id, text))
+                alternate = _fusion_candidate(event, fusion_enabled)
+                segment = _Segment(
+                    segment_id=seg_id, fused=alternate is not None, t_final=time.monotonic()
+                )
+                await order_queue.put(segment)
+                asyncio.create_task(
+                    translate_segment(segment, event.text, alternate),
+                    name=f"translate_{seg_id}",
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Error reading from Deepgram")
+            logger.exception("Error consuming transcripts")
             session_ended.set()
 
-    async def switch_to_language(new_lang: str) -> None:
-        """Manual switch requested by the client (see handle_control_message).
-        Deepgram has no in-place way to change a live connection's language,
-        so this opens a new connection and swaps it in."""
-        nonlocal dg_client, current_lang, deepgram_reader_task
-        if uses_multi_mode:
-            return  # this session auto-switches via Deepgram's own multi mode
-        if new_lang not in candidate_langs or new_lang == current_lang:
-            return
-
-        try:
-            new_client = DeepgramLiveClient(
-                settings.deepgram_api_key, model=settings.deepgram_stt_model, language=new_lang
-            )
-            await new_client.connect()
-        except Exception as exc:
-            logger.exception("Failed to switch source language to %s", new_lang)
-            await _safe_send_json(client_ws, {"type": "error", "data": f"Could not switch to {new_lang}: {exc}"})
-            return
-
-        old_client = dg_client
-        async with dg_lock:
-            dg_client = new_client
-            current_lang = new_lang
-        if deepgram_reader_task is not None:
-            deepgram_reader_task.cancel()
-        await old_client.close()
-        await _safe_send_json(client_ws, {"type": "status", "data": "language_switched", "language": new_lang})
-        deepgram_reader_task = asyncio.create_task(run_deepgram_reader(new_client), name="deepgram_reader")
-
-    async def handle_control_message(raw: str) -> None:
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        if payload.get("type") == "switch_language":
-            await switch_to_language(payload.get("language", ""))
-
     async def client_reader() -> None:
-        """Reads raw client WebSocket frames: binary frames are audio,
-        forwarded to whichever Deepgram connection is currently active; text
-        frames are JSON control messages (currently just switch_language)."""
+        """Binary frames are audio, forwarded to every Deepgram connection;
+        text frames are JSON control messages."""
         try:
             while True:
                 message = await client_ws.receive()
@@ -211,127 +247,95 @@ async def stream_endpoint(client_ws: WebSocket):
                     break
                 data = message.get("bytes")
                 if data is not None:
-                    async with dg_lock:
-                        client = dg_client
-                    try:
-                        await client.send_audio(data)
-                    except Exception:
-                        # Most likely landed exactly during a language-switch
-                        # reconnect; drop this ~50ms chunk rather than
-                        # tearing down the whole forwarding loop over it.
-                        pass
+                    await stt.push_audio(data)
                     continue
                 text = message.get("text")
                 if text is not None:
-                    await handle_control_message(text)
+                    await _handle_control_message(text, stt, dropped, client_ws)
         except WebSocketDisconnect:
             logger.info("Client disconnected (audio stream)")
         except Exception:
             logger.exception("Error in client reader")
         finally:
+            # Flush whatever Deepgram is still holding so the last utterance
+            # isn't lost waiting out the endpointing window.
+            await stt.finalize()
             session_ended.set()
 
-    async def translation_worker() -> None:
-        while True:
-            item = await translation_queue.get()
-            if item is None:
-                break
-            seg_id, text = item
-            try:
-                async for delta in stream_translation(text, target_language):
-                    await _safe_send_json(
-                        client_ws,
-                        {"type": "translation", "segment_id": seg_id, "data": delta, "final": False},
-                    )
-                await _safe_send_json(
-                    client_ws,
-                    {"type": "translation", "segment_id": seg_id, "data": "", "final": True},
-                )
-            except Exception as exc:
-                logger.exception("Translation failed for segment %s", seg_id)
-                await _safe_send_json(client_ws, {"type": "error", "data": f"Translation failed: {exc}"})
-
-    deepgram_reader_task = asyncio.create_task(run_deepgram_reader(dg_client), name="deepgram_reader")
-    client_reader_task = asyncio.create_task(client_reader(), name="client_reader")
-    translation_task = asyncio.create_task(translation_worker(), name="translation_worker")
+    tasks = [
+        asyncio.create_task(consume_transcripts(), name="consume_transcripts"),
+        asyncio.create_task(client_reader(), name="client_reader"),
+        asyncio.create_task(emit_translations(), name="emit_translations"),
+    ]
 
     try:
         await session_ended.wait()
     finally:
-        client_reader_task.cancel()
-        deepgram_reader_task.cancel()
-        await translation_queue.put(None)
-        await asyncio.gather(client_reader_task, deepgram_reader_task, translation_task, return_exceptions=True)
-        await dg_client.close()
+        await stt.close()
+        # The client is gone by this point, so in-flight translations have
+        # nowhere to render; drop them rather than waiting them out.
+        await order_queue.put(None)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await _safe_close(client_ws)
         logger.info("Session cleaned up")
 
 
-@app.websocket("/ws/diarize")
-async def diarize_endpoint(client_ws: WebSocket):
-    """Accepts a raw PCM16 audio stream (same format as /ws/stream) and
-    streams back speaker-turn events as diart resolves each analysis window.
-    Independent of /ws/stream so a client can run on-device STT and cloud
-    diarization concurrently over the same audio."""
-    await client_ws.accept()
+def _fusion_candidate(event: TranscriptEvent, enabled: bool) -> Optional[str]:
+    """Returns the runner-up transcript when the two recognizers disagreed
+    closely enough that the speaker was probably code-switching.
 
-    diarizer = StreamingDiarizer(
-        hf_token=settings.huggingface_token,
-        max_speakers=settings.diarization_max_speakers,
-    )
+    A clear winner means monolingual speech and the runner-up is noise; a
+    near-tie means each recognizer got its own language right and mangled the
+    other, and only both together determine what was said.
+    """
+    if not enabled or event.runner_up is None:
+        return None
+    if settings.fusion_margin <= 0:
+        return None
+    if event.margin > settings.fusion_margin:
+        return None
+    return event.runner_up.text
+
+
+async def _handle_control_message(
+    raw: str, stt: MultiLanguageSTT, dropped: list[str], client_ws: WebSocket
+) -> None:
     try:
-        diarizer.start()
-    except DiarizationUnavailable as exc:
-        logger.error("Diarization unavailable: %s", exc)
-        await _safe_send_json(client_ws, {"type": "error", "data": str(exc)})
-        await _safe_close(client_ws)
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
         return
-
-    await _safe_send_json(client_ws, {"type": "status", "data": "connected"})
-
-    async def client_to_diarizer() -> None:
-        try:
-            while True:
-                chunk = await client_ws.receive_bytes()
-                await diarizer.push_audio(chunk)
-        except WebSocketDisconnect:
-            logger.info("Client disconnected (diarize stream)")
-        except Exception:
-            logger.exception("Error forwarding audio to diarizer")
-
-    async def diarizer_to_client() -> None:
-        try:
-            async for speaker, start, end in diarizer.turns():
-                await _safe_send_json(
-                    client_ws,
-                    {"type": "speaker_turn", "speaker": speaker, "start": start, "end": end},
-                )
-        except Exception:
-            logger.exception("Error reading from diarizer")
-
-    tasks = [
-        asyncio.create_task(client_to_diarizer(), name="client_to_diarizer"),
-        asyncio.create_task(diarizer_to_client(), name="diarizer_to_client"),
-    ]
+    if payload.get("type") != "switch_language":
+        return
+    language = payload.get("language", "")
+    # Every language the session actually connected for is detected
+    # automatically, so a switch request for one of those is a no-op. Only
+    # languages pushed past the connection ceiling need this path.
+    if language not in dropped:
+        return
     try:
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await diarizer.close()
-        await _safe_close(client_ws)
-        logger.info("Diarization session cleaned up")
+        await stt.swap_in_language(language)
+    except Exception as exc:
+        logger.exception("Failed to swap in %s", language)
+        await _safe_send_json(
+            client_ws, {"type": "error", "data": f"Could not switch to {language}: {exc}"}
+        )
+        return
+    dropped[:] = [c for c in dropped if c != language]
+    await _safe_send_json(
+        client_ws,
+        {"type": "status", "data": "language_switched", "language": language},
+    )
 
 
 @app.websocket("/ws/translate")
 async def translate_endpoint(client_ws: WebSocket):
     """Accepts {"segment_id", "text", "target_lang"} JSON requests and streams
     back translation deltas, reusing stream_translation(). Decoupled from STT
-    so a client that already has transcribed text (e.g. on-device) can get a
-    cloud translation fallback without re-uploading audio. A single worker
-    processes requests in order, so responses can't interleave out of order
-    the way concurrent tasks per segment would."""
+    so a client that already has transcribed text can get a cloud translation
+    without re-uploading audio. A single worker processes requests in order,
+    so responses can't interleave."""
     await client_ws.accept()
     await _safe_send_json(client_ws, {"type": "status", "data": "connected"})
 
@@ -344,7 +348,9 @@ async def translate_endpoint(client_ws: WebSocket):
                 try:
                     req = TranslateRequest.model_validate(raw)
                 except ValidationError as exc:
-                    await _safe_send_json(client_ws, {"type": "error", "data": f"Invalid request: {exc}"})
+                    await _safe_send_json(
+                        client_ws, {"type": "error", "data": f"Invalid request: {exc}"}
+                    )
                     continue
                 await queue.put(req)
         except WebSocketDisconnect:
@@ -360,18 +366,31 @@ async def translate_endpoint(client_ws: WebSocket):
             if req is None:
                 break
             try:
-                async for delta in stream_translation(req.text, req.target_lang):
+                model = pick_model([], req.target_lang)
+                async for delta in stream_translation(req.text, req.target_lang, model=model):
                     await _safe_send_json(
                         client_ws,
-                        {"type": "translation", "segment_id": req.segment_id, "data": delta, "final": False},
+                        {
+                            "type": "translation",
+                            "segment_id": req.segment_id,
+                            "data": delta,
+                            "final": False,
+                        },
                     )
                 await _safe_send_json(
                     client_ws,
-                    {"type": "translation", "segment_id": req.segment_id, "data": "", "final": True},
+                    {
+                        "type": "translation",
+                        "segment_id": req.segment_id,
+                        "data": "",
+                        "final": True,
+                    },
                 )
             except Exception as exc:
                 logger.exception("Translation failed for segment %s", req.segment_id)
-                await _safe_send_json(client_ws, {"type": "error", "data": f"Translation failed: {exc}"})
+                await _safe_send_json(
+                    client_ws, {"type": "error", "data": f"Translation failed: {exc}"}
+                )
 
     tasks = [
         asyncio.create_task(receive_requests(), name="receive_requests"),

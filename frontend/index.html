@@ -165,6 +165,26 @@
     margin-top: 0.3rem;
     font-style: italic;
   }
+  .fused-tag {
+    color: #d8a657;
+    background: rgba(216, 166, 87, 0.16);
+    border-radius: 999px;
+    padding: 0.05rem 0.4rem;
+    font-weight: 700;
+  }
+  /* A word the multi-language stream heard in a different language from the
+     rest of the sentence. */
+  .foreign-word {
+    color: #d8a657;
+    border-bottom: 1px dotted rgba(216, 166, 87, 0.5);
+  }
+  .bubble-timing {
+    display: none;
+    font-size: 0.68rem;
+    color: var(--muted);
+    margin-top: 0.35rem;
+    font-variant-numeric: tabular-nums;
+  }
   .bubble-translation:empty::before {
     content: "translating…";
     color: var(--muted);
@@ -364,16 +384,37 @@
     <div class="settings-section">
       <span class="field-label">Spoken languages</span>
       <div id="langChecks" class="lang-checks"></div>
-      <p class="hint">Select every language you expect to hear. If every language you pick is tagged "auto", Babel switches between them automatically as speakers change languages (Deepgram's native code-switching — reliable because it listens for all of them at once, not by guessing from already-transcribed text). If any pick isn't tagged "auto", automatic switching isn't reliable for that combination — you'll get a manual language-picker in the transcript view instead.</p>
+      <p class="hint">Select every language you expect to hear — all of them are detected automatically as people switch, with no toggling. Languages tagged <strong>shared</strong> are transcribed together by one stream and can be mixed freely <em>within a single sentence</em>. Each language without that tag needs its own parallel stream, which is billed separately and detects language per sentence rather than per word.</p>
+      <p class="hint" id="connectionEstimate"></p>
+    </div>
+
+    <div class="settings-section">
+      <label class="field-label" for="modelSelect">Translation model</label>
+      <select id="modelSelect">
+        <option value="auto">Auto — match the languages in use</option>
+        <option value="fast">Fast — llama-3.3-70b</option>
+        <option value="quality">Quality — gpt-oss-120b</option>
+      </select>
+      <p class="hint" id="modelHint"></p>
     </div>
 
     <div class="settings-section">
       <div class="toggle-row">
         <div>
-          <span class="field-label" style="margin-bottom:0.1rem;">Speaker separation</span>
-          <p class="hint" style="margin-top:0.15rem;">Labels who's speaking. Needs the backend's diarization setup (HUGGINGFACE_TOKEN + diart) — leave off if you haven't configured that yet.</p>
+          <span class="field-label" style="margin-bottom:0.1rem;">Reconstruct mixed speech</span>
+          <p class="hint" style="margin-top:0.15rem;">When two streams disagree closely — the signature of a sentence mixing two languages — send both transcripts to the translator so it can work out what was actually said. Only engages on genuine near-ties.</p>
         </div>
-        <input id="diarizationToggle" type="checkbox" />
+        <input id="fusionToggle" type="checkbox" />
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="toggle-row">
+        <div>
+          <span class="field-label" style="margin-bottom:0.1rem;">Show latency</span>
+          <p class="hint" style="margin-top:0.15rem;">Print time-to-first-word and total translation time under each bubble.</p>
+        </div>
+        <input id="timingsToggle" type="checkbox" />
       </div>
     </div>
 
@@ -403,13 +444,31 @@
   ];
   const languageName = (code) => LANGUAGES.find((l) => l.code === code)?.name ?? code;
 
-  // Mirrors backend/app/main.py's MULTI_MODE_LANGUAGES: the set Deepgram's
-  // native `language=multi` code-switching mode actually covers. Selecting
-  // 2+ spoken languages that are ALL in this set gets automatic switching;
-  // anything else (any outlier language involved) falls back to the manual
-  // picker, since there's no reliable way to auto-detect switches Deepgram
-  // itself doesn't natively support (see backend/README.md for why).
+  // Mirrors backend/app/stt_session.py's MULTI_MODE_LANGUAGES: the set
+  // Deepgram's native `language=multi` code-switching covers. Every selected
+  // language is now detected automatically either way -- the difference is
+  // cost and granularity. Two or more of these share ONE Deepgram connection
+  // and code-switch mid-sentence with per-word language tags; anything
+  // outside the set needs its own parallel connection, which is billed
+  // separately and resolves language per utterance rather than per word.
   const MULTI_MODE_LANGUAGES = new Set(["en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"]);
+  const STT_CONNECTION_CEILING = 4; // mirrors settings.stt_connection_ceiling
+
+  // Same planning rule as the backend's plan_connections(), so Settings can
+  // show what a selection will actually cost before the session starts.
+  function planConnections(codes) {
+    const shared = codes.filter((c) => MULTI_MODE_LANGUAGES.has(c));
+    const outliers = codes.filter((c) => !MULTI_MODE_LANGUAGES.has(c));
+    const groups = [];
+    if (shared.length >= 2) groups.push(shared);
+    else if (shared.length === 1) groups.push(shared);
+    for (const code of outliers) groups.push([code]);
+    return {
+      auto: groups.slice(0, STT_CONNECTION_CEILING).flat(),
+      manual: groups.slice(STT_CONNECTION_CEILING).flat(),
+      connections: Math.min(groups.length, STT_CONNECTION_CEILING),
+    };
+  }
 
   // ---- AudioWorkletProcessor source, loaded into the audio thread via a
   // Blob URL. Downsamples by simple stride decimation (no anti-aliasing
@@ -458,7 +517,12 @@
     backendOrigin: "",
     targetLanguage: "English",
     spokenLanguages: ["en"],
-    diarizationEnabled: false,
+    // auto | fast | quality -- see backend/app/translator.py's pick_model.
+    modelMode: "auto",
+    // Reconstruct code-switched speech from two recognizers' competing
+    // transcripts (only engages when they disagree closely).
+    fusionEnabled: true,
+    showTimings: false,
   };
 
   function loadSettings() {
@@ -486,10 +550,13 @@
   }
   function streamUrl() {
     const langs = settings.spokenLanguages.length ? settings.spokenLanguages : [DEFAULT_SETTINGS.spokenLanguages[0]];
-    return `${wsBase()}/ws/stream?lang=${encodeURIComponent(settings.targetLanguage)}&source_langs=${encodeURIComponent(langs.join(","))}`;
-  }
-  function diarizeUrl() {
-    return `${wsBase()}/ws/diarize`;
+    const params = new URLSearchParams({
+      lang: settings.targetLanguage,
+      source_langs: langs.join(","),
+      model_mode: settings.modelMode,
+      fusion: settings.fusionEnabled ? "1" : "0",
+    });
+    return `${wsBase()}/ws/stream?${params.toString()}`;
   }
 
   // ---------------------------------------------------------------------
@@ -507,7 +574,11 @@
   const backendInput = document.getElementById("backendInput");
   const targetSelect = document.getElementById("targetSelect");
   const langChecks = document.getElementById("langChecks");
-  const diarizationToggle = document.getElementById("diarizationToggle");
+  const connectionEstimate = document.getElementById("connectionEstimate");
+  const modelSelect = document.getElementById("modelSelect");
+  const modelHint = document.getElementById("modelHint");
+  const fusionToggle = document.getElementById("fusionToggle");
+  const timingsToggle = document.getElementById("timingsToggle");
   const installBanner = document.getElementById("installBanner");
   const dismissInstallBtn = document.getElementById("dismissInstallBtn");
 
@@ -520,7 +591,17 @@
     errorBar.classList.remove("visible");
     errorBar.textContent = "";
   }
-  function scrollToBottom() { feedEl.scrollTop = feedEl.scrollHeight; }
+  // Coalesced to one scroll per animation frame. This used to run on every
+  // translation delta, forcing a synchronous layout per streamed token.
+  let scrollQueued = false;
+  function scrollToBottom() {
+    if (scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(() => {
+      scrollQueued = false;
+      feedEl.scrollTop = feedEl.scrollHeight;
+    });
+  }
 
   // ---------------------------------------------------------------------
   // Settings panel wiring
@@ -548,17 +629,53 @@
         settings.spokenLanguages = checked.length ? checked : [lang.code]; // always keep at least one
         if (!checked.length) input.checked = true;
         saveSettings();
+        renderConnectionEstimate();
+        renderModelHint();
       });
       label.append(input, document.createTextNode(lang.name));
       if (MULTI_MODE_LANGUAGES.has(lang.code)) {
         const tag = document.createElement("span");
         tag.className = "lang-check-tag";
-        tag.textContent = "auto";
+        tag.textContent = "shared";
         label.appendChild(tag);
       }
       langChecks.appendChild(label);
     }
-    diarizationToggle.checked = settings.diarizationEnabled;
+    modelSelect.value = settings.modelMode;
+    fusionToggle.checked = settings.fusionEnabled;
+    timingsToggle.checked = settings.showTimings;
+    renderConnectionEstimate();
+    renderModelHint();
+  }
+
+  // Deepgram bills per open stream, so make the cost of a selection visible
+  // at the point the selection is made rather than only in the backend log.
+  function renderConnectionEstimate() {
+    const plan = planConnections(settings.spokenLanguages);
+    const n = plan.connections;
+    let text = `This session will open ${n} Deepgram stream${n === 1 ? "" : "s"}.`;
+    if (n > 1) text += " Each is billed separately while you're listening.";
+    if (plan.manual.length) {
+      text += ` Over the ${STT_CONNECTION_CEILING}-stream limit — ${plan.manual.map(languageName).join(", ")} will need the manual picker.`;
+    }
+    connectionEstimate.textContent = text;
+  }
+
+  // Mirrors pick_model() in backend/app/translator.py.
+  const FAST_MODEL_LANGUAGES = new Set(["en", "de", "fr", "it", "pt", "hi", "es", "th"]);
+  function renderModelHint() {
+    if (settings.modelMode === "fast") {
+      modelHint.textContent = "Fastest to first word, but only covers English, German, French, Italian, Portuguese, Hindi and Spanish well.";
+      return;
+    }
+    if (settings.modelMode === "quality") {
+      modelHint.textContent = "Best coverage for Arabic, Tagalog, Tamil, Chinese, Japanese, Korean and Turkish. Slightly slower to the first word.";
+      return;
+    }
+    const outliers = settings.spokenLanguages.filter((c) => !FAST_MODEL_LANGUAGES.has(c));
+    modelHint.textContent = outliers.length
+      ? `Will use gpt-oss-120b — ${outliers.map(languageName).join(", ")} ${outliers.length === 1 ? "is" : "are"} outside llama-3.3's supported languages.`
+      : "Will use llama-3.3-70b — every selected language is one it supports, so you get the faster model.";
   }
 
   settingsBtn.addEventListener("click", () => {
@@ -570,31 +687,33 @@
     if (e.target === settingsOverlay) settingsOverlay.classList.remove("visible");
   });
   backendInput.addEventListener("change", () => { settings.backendOrigin = backendInput.value; saveSettings(); });
-  targetSelect.addEventListener("change", () => { settings.targetLanguage = targetSelect.value; saveSettings(); });
-  diarizationToggle.addEventListener("change", () => { settings.diarizationEnabled = diarizationToggle.checked; saveSettings(); });
+  targetSelect.addEventListener("change", () => { settings.targetLanguage = targetSelect.value; saveSettings(); renderModelHint(); });
+  modelSelect.addEventListener("change", () => { settings.modelMode = modelSelect.value; saveSettings(); renderModelHint(); });
+  fusionToggle.addEventListener("change", () => { settings.fusionEnabled = fusionToggle.checked; saveSettings(); });
+  timingsToggle.addEventListener("change", () => { settings.showTimings = timingsToggle.checked; saveSettings(); });
 
   // ---------------------------------------------------------------------
   // Conversation state + rendering
   // ---------------------------------------------------------------------
-  let turns = [];           // [{id, speakerLabel, sourceText, sourceLocale, translatedText, isFinal, isTranslationFinal, timestamp}]
-  let speakerTurns = [];    // [{speaker, start, end}]
+  // Keyed by segment_id. Was a linear array with .find() on every transcript
+  // and every streamed translation delta.
+  const turns = new Map();
   const turnElements = new Map();
   let interimText = "";
   let interimLanguage = null;
   let currentLanguage = null;
-  let sessionStartMs = 0;
-  let multiMode = false;
-  let pickerCandidateLangs = []; // this session's spoken-language list, captured at connect time
+  let autoLanguages = [];        // detected automatically this session
+  let pickerCandidateLangs = []; // languages needing the manual picker this session
 
-  // Shown only for sessions where multi_mode is false and 2+ languages were
-  // selected -- i.e. the candidate set includes something outside
-  // MULTI_MODE_LANGUAGES, so Deepgram can't auto-switch reliably (see the
-  // comment on MULTI_MODE_LANGUAGES above). Tapping a chip sends a
-  // switch_language control message; the active chip updates once the
-  // backend confirms via a "language_switched" status message, not
-  // optimistically, since the switch briefly reconnects Deepgram server-side.
+  // Only shown when a session selected more languages than the backend's
+  // connection ceiling allows streams for. Everything within the ceiling is
+  // transcribed concurrently and detected automatically, so in normal use
+  // this stays hidden. Tapping a chip sends a switch_language control
+  // message; the active chip updates once the backend confirms via a
+  // "language_switched" status, not optimistically, since the swap
+  // reconnects a Deepgram stream server-side.
   function renderLanguagePicker() {
-    const shouldShow = !multiMode && pickerCandidateLangs.length > 1;
+    const shouldShow = pickerCandidateLangs.length > 0;
     languagePicker.classList.toggle("visible", shouldShow);
     if (!shouldShow) {
       languagePicker.innerHTML = "";
@@ -617,10 +736,14 @@
     }
   }
 
-  function colorForSpeaker(speaker) {
-    let hash = 0;
-    for (let i = 0; i < speaker.length; i++) hash = (hash * 31 + speaker.charCodeAt(i)) >>> 0;
-    return `hsl(${hash % 360}, 55%, 62%)`;
+  // Deepgram numbers speakers from 0 in order of first appearance. Spread the
+  // hues so adjacent speakers stay visually distinct.
+  const SPEAKER_HUES = [210, 145, 28, 320, 265, 55, 175, 0];
+  function colorForSpeaker(index) {
+    return `hsl(${SPEAKER_HUES[index % SPEAKER_HUES.length]}, 60%, 64%)`;
+  }
+  function speakerName(index) {
+    return `Speaker ${index + 1}`;
   }
 
   function renderInterim() {
@@ -645,90 +768,104 @@
       speakerEl.style.display = "none";
       const langEl = document.createElement("span");
       langEl.className = "lang-tag";
-      meta.append(speakerEl, langEl);
+      const fusedEl = document.createElement("span");
+      fusedEl.className = "lang-tag fused-tag";
+      fusedEl.textContent = "mixed";
+      fusedEl.style.display = "none";
+      meta.append(speakerEl, langEl, fusedEl);
       const sourceEl = document.createElement("div");
       sourceEl.className = "bubble-source";
       const translationEl = document.createElement("div");
       translationEl.className = "bubble-translation";
-      el.append(meta, sourceEl, translationEl);
+      const timingEl = document.createElement("div");
+      timingEl.className = "bubble-timing";
+      el.append(meta, sourceEl, translationEl, timingEl);
       feedEl.insertBefore(el, interimRow);
-      refs = { el, speakerEl, langEl, sourceEl, translationEl };
+      refs = { el, speakerEl, langEl, fusedEl, sourceEl, translationEl, timingEl };
       turnElements.set(turn.id, refs);
     }
 
-    refs.sourceEl.textContent = turn.sourceText;
+    renderSource(refs.sourceEl, turn);
     refs.translationEl.textContent = turn.translatedText;
     refs.translationEl.classList.toggle("pending", turn.isFinal && !turn.translatedText);
     refs.langEl.textContent = turn.sourceLocale ? turn.sourceLocale.toUpperCase() : "";
-    if (turn.speakerLabel) {
-      refs.speakerEl.textContent = turn.speakerLabel;
+    refs.fusedEl.style.display = turn.fused ? "" : "none";
+
+    if (turn.speaker !== null && turn.speaker !== undefined) {
+      refs.speakerEl.textContent = speakerName(turn.speaker);
       refs.speakerEl.style.display = "";
-      refs.speakerEl.style.setProperty("--speaker-color", colorForSpeaker(turn.speakerLabel));
+      refs.speakerEl.style.setProperty("--speaker-color", colorForSpeaker(turn.speaker));
     } else {
       refs.speakerEl.style.display = "none";
+    }
+
+    if (settings.showTimings && turn.msTotal != null) {
+      refs.timingEl.textContent = `first word ${turn.msToFirstToken ?? "?"}ms · complete ${turn.msTotal}ms`;
+      refs.timingEl.style.display = "";
+    } else {
+      refs.timingEl.style.display = "none";
     }
     scrollToBottom();
   }
 
-  function upsertTurn(id, text, language, timestamp, isFinal) {
-    let turn = turns.find((t) => t.id === id);
+  // A sentence transcribed by a `multi` stream can legitimately contain more
+  // than one language, tagged per word. Render those words with their own
+  // language so mixed speech is visible rather than flattened to one label.
+  function renderSource(el, turn) {
+    if (!turn.wordLanguages || !turn.wordLanguages.length) {
+      el.textContent = turn.sourceText;
+      return;
+    }
+    el.textContent = "";
+    const dominant = turn.sourceLocale;
+    for (const [i, entry] of turn.wordLanguages.entries()) {
+      const span = document.createElement("span");
+      span.textContent = (i ? " " : "") + entry.word;
+      if (entry.language !== dominant) {
+        span.className = "foreign-word";
+        span.title = entry.language.toUpperCase();
+      }
+      el.appendChild(span);
+    }
+  }
+
+  function upsertTurn(id, text, language, isFinal, speaker, wordLanguages) {
+    let turn = turns.get(id);
     if (turn) {
       turn.sourceText = text;
       turn.isFinal = isFinal;
+      if (speaker !== null && speaker !== undefined) turn.speaker = speaker;
     } else {
       turn = {
-        id, speakerLabel: null, sourceText: text, sourceLocale: language,
-        translatedText: "", isFinal, isTranslationFinal: false, timestamp,
+        id, speaker: speaker ?? null, sourceText: text, sourceLocale: language,
+        wordLanguages: wordLanguages ?? null, translatedText: "", isFinal,
+        isTranslationFinal: false, fused: false, msToFirstToken: null, msTotal: null,
       };
-      turns.push(turn);
+      turns.set(id, turn);
     }
-    applySpeakerLabels();
     renderTurn(turn);
     return turn;
   }
 
-  function applyTranslationDelta(segmentId, delta, isFinal) {
-    const turn = turns.find((t) => t.id === segmentId);
+  function applyTranslationDelta(msg) {
+    const turn = turns.get(msg.segment_id);
     if (!turn) return;
-    turn.translatedText += delta;
-    if (isFinal) turn.isTranslationFinal = true;
+    turn.translatedText += msg.data;
+    if (msg.final) {
+      turn.isTranslationFinal = true;
+      turn.msToFirstToken = msg.ms_to_first_token ?? null;
+      turn.msTotal = msg.ms_total ?? null;
+      turn.fused = !!msg.fused;
+    }
     renderTurn(turn);
   }
 
-  // Diarization resolves ~5s analysis windows behind the audio (diart's
-  // window), so this re-runs on every new SpeakerTurn or transcript turn.
-  // Point-based matching (contains, then nearest-within-2s) is an
-  // approximation -- exact alignment isn't attempted since diart's own
-  // ~500ms window shift already bounds the achievable precision. See
-  // ios/Babel/Session/ConversationSession.swift for the same logic ported
-  // from Swift, and ios/README.md for the expected-behavior notes.
-  function applySpeakerLabels() {
-    for (const turn of turns) {
-      if (turn.speakerLabel) continue;
-      const t = turn.timestamp;
-      let match = speakerTurns.find((st) => t >= st.start && t <= st.end);
-      if (!match && speakerTurns.length) {
-        let nearest = null, nearestDist = Infinity;
-        for (const st of speakerTurns) {
-          const dist = Math.abs((st.start + st.end) / 2 - t);
-          if (dist < nearestDist) { nearestDist = dist; nearest = st; }
-        }
-        if (nearest && nearestDist < 2.0) match = nearest;
-      }
-      if (match) {
-        turn.speakerLabel = match.speaker;
-        renderTurn(turn);
-      }
-    }
-  }
-
   function resetConversation() {
-    turns = [];
-    speakerTurns = [];
+    turns.clear();
     turnElements.clear();
     interimText = "";
     interimLanguage = null;
-    multiMode = false;
+    autoLanguages = [];
     pickerCandidateLangs = [];
     feedEl.querySelectorAll(".bubble").forEach((el) => el.remove());
     renderInterim();
@@ -744,7 +881,6 @@
 
     switch (msg.type) {
       case "transcript": {
-        const elapsed = (Date.now() - sessionStartMs) / 1000;
         if (!msg.is_final) {
           interimText = msg.data;
           interimLanguage = msg.language;
@@ -753,20 +889,26 @@
           interimText = "";
           interimLanguage = null;
           renderInterim();
-          upsertTurn(msg.segment_id, msg.data, msg.language, elapsed, true);
+          currentLanguage = msg.language || currentLanguage;
+          upsertTurn(msg.segment_id, msg.data, msg.language, true, msg.speaker, msg.word_languages);
         }
         return;
       }
       case "translation":
-        applyTranslationDelta(msg.segment_id, msg.data, msg.final);
+        applyTranslationDelta(msg);
         return;
       case "status":
         if (msg.data === "connected") {
-          multiMode = !!msg.multi_mode;
-          currentLanguage = msg.language || currentLanguage;
-          pickerCandidateLangs = [...settings.spokenLanguages];
+          autoLanguages = msg.languages || [];
+          pickerCandidateLangs = msg.manual_languages || [];
+          currentLanguage = autoLanguages[0] || currentLanguage;
           renderLanguagePicker();
-          setStatus(multiMode ? "listening (auto language-switch)" : "listening");
+          const streams = msg.connections === 1 ? "1 stream" : `${msg.connections} streams`;
+          setStatus(`listening · ${streams}${msg.diarization ? " · speakers" : ""}`);
+          console.info("Babel session:", {
+            autoDetected: autoLanguages, manualOnly: pickerCandidateLangs,
+            streams: msg.connections, diarization: msg.diarization, model: msg.model,
+          });
         } else if (msg.data === "language_switched" && msg.language) {
           currentLanguage = msg.language;
           renderLanguagePicker();
@@ -779,17 +921,6 @@
         setStatus("error");
         showError(msg.data);
         return;
-    }
-  }
-
-  function handleDiarizeMessage(event) {
-    let msg;
-    try { msg = JSON.parse(event.data); } catch { return; }
-    if (msg.type === "speaker_turn") {
-      speakerTurns.push({ speaker: msg.speaker, start: msg.start, end: msg.end });
-      applySpeakerLabels();
-    } else if (msg.type === "error") {
-      showError(`Speaker separation: ${msg.data}`);
     }
   }
 
@@ -817,12 +948,14 @@
   // Audio capture + WebSocket lifecycle
   // ---------------------------------------------------------------------
   let audioContext, mediaStream, sourceNode, workletNode, scriptNode;
-  let streamWs, diarizeWs;
+  let streamWs;
   let isListening = false;
 
+  // One upload regardless of how many languages are in play -- the server
+  // fans the audio out to its Deepgram streams. Speaker labels now ride
+  // along on the transcript, so there's no second socket to feed.
   function sendAudioChunk(buffer) {
     if (streamWs && streamWs.readyState === WebSocket.OPEN) streamWs.send(buffer);
-    if (diarizeWs && diarizeWs.readyState === WebSocket.OPEN) diarizeWs.send(buffer);
   }
 
   async function startScriptProcessorFallback() {
@@ -858,38 +991,36 @@
     resetConversation();
     currentLanguage = settings.spokenLanguages[0] || DEFAULT_SETTINGS.spokenLanguages[0];
 
+    // Socket handshake (plus the server's own Deepgram connections) and the
+    // mic permission/warm-up are independent, so run them concurrently
+    // instead of paying for them back to back.
     streamWs = openSocket(streamUrl());
-    const opened = await new Promise((resolve) => {
+    const socketOpen = new Promise((resolve) => {
       streamWs.addEventListener("open", () => resolve(true), { once: true });
       streamWs.addEventListener("error", () => resolve(false), { once: true });
     });
+    const micReady = navigator.mediaDevices
+      .getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+      .catch(() => null);
+
+    const [opened, stream] = await Promise.all([socketOpen, micReady]);
+
     if (!opened) {
       setStatus("connection failed");
+      stream?.getTracks().forEach((t) => t.stop());
       toggleBtn.disabled = false;
       return;
     }
+    if (!stream) {
+      setStatus("mic access denied");
+      streamWs.close();
+      toggleBtn.disabled = false;
+      return;
+    }
+    mediaStream = stream;
     streamWs.onmessage = handleStreamMessage;
     streamWs.onclose = () => { if (isListening) stopListening(); };
 
-    if (settings.diarizationEnabled) {
-      diarizeWs = openSocket(diarizeUrl());
-      diarizeWs.onmessage = handleDiarizeMessage;
-      diarizeWs.onerror = () => showError("Could not connect to the diarization backend.");
-    }
-
-    try {
-      mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-      });
-    } catch (err) {
-      setStatus("mic access denied");
-      streamWs.close();
-      diarizeWs?.close();
-      toggleBtn.disabled = false;
-      return;
-    }
-
-    sessionStartMs = Date.now();
     await requestWakeLock();
 
     audioContext = new AudioContext();
@@ -927,14 +1058,12 @@
     cleanupAudio();
     releaseWakeLock();
     if (streamWs && streamWs.readyState === WebSocket.OPEN) streamWs.close();
-    if (diarizeWs && diarizeWs.readyState === WebSocket.OPEN) diarizeWs.close();
     streamWs = null;
-    diarizeWs = null;
     toggleBtn.disabled = false;
     toggleBtn.textContent = "Start Listening";
     toggleBtn.classList.remove("listening");
     setStatus("stopped");
-    multiMode = false;
+    autoLanguages = [];
     pickerCandidateLangs = [];
     renderLanguagePicker();
   }

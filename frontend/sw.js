@@ -3,7 +3,7 @@
 // normally while online instead of getting stuck behind a stale cache --
 // bump CACHE_VERSION when the app shell files change so old entries get
 // evicted on the next activate.
-const CACHE_VERSION = "babel-v1";
+const CACHE_VERSION = "babel-v2";
 const APP_SHELL = [
   "./",
   "./index.html",
@@ -26,8 +26,8 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-// WebSocket connections (/ws/stream, /ws/diarize, /ws/translate) never hit
-// this handler -- service workers only intercept fetch (HTTP) requests.
+// WebSocket connections (/ws/stream, /ws/translate) never hit this handler --
+// service workers only intercept fetch (HTTP) requests.
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
 

@@ -1,9 +1,9 @@
 # Babel — Real-Time Audio Translator
 
-Low-latency speech-to-speech captioning. Two clients share one backend:
+Low-latency speech-to-speech captioning.
 
-- **Web / PWA** (`frontend/`) — **the primary way to use Babel on a phone.** Mic audio → Deepgram Nova-3 (streaming STT, with automatic language switching for bilingual/multilingual speech) → Groq Llama (streaming translation) → browser, over `/ws/stream`, plus an optional second connection to `/ws/diarize` for speaker separation. Installable to an iPhone home screen (manifest + service worker), no app store, no Mac required. See "Run" below for setup and "Test locally" for the on-phone install steps.
-- **iOS native app** (`ios/`) — a secondary/reference path: a SwiftUI app using Apple's on-device Speech and Translation frameworks instead of the cloud pipeline. **Requires Xcode on macOS to build** (or a cloud Mac/CI service) — see [ios/README.md](ios/README.md). Not the recommended path unless you have Mac access, since the PWA gets you running today with no build step at all.
+- **Web / PWA** (`frontend/`) — the primary client, and the focus of active development. Mic audio → Deepgram Nova-3 (streaming STT, with automatic language detection and speaker labels) → Groq (streaming translation) → browser, over a single `/ws/stream` connection. Installable to an iPhone home screen (manifest + service worker), no app store, no Mac required. See "Run" below for setup and "Test locally" for the on-phone install steps.
+- **iOS native app** (`ios/`) — early scaffolding only, not built or wired to the current backend. The PWA is the cross-platform path; treat `ios/` as reference material until someone picks it up. See [ios/README.md](ios/README.md).
 
 ## Layout
 
@@ -11,15 +11,15 @@ Low-latency speech-to-speech captioning. Two clients share one backend:
 Babel/
   backend/
     app/
-      main.py             FastAPI app: /ws/stream, /ws/diarize, /ws/translate
+      main.py             FastAPI app: /ws/stream, /ws/translate
+      stt_session.py      Multi-connection STT: fan-out, arbitration, speaker anchor
       deepgram_client.py  Deepgram live-transcription WebSocket wrapper
-      translator.py       Groq streaming translation
-      diarization.py      diart (pyannote) streaming speaker diarization
+      translator.py       Groq streaming translation + model selection
       config.py           Env-var settings
       schemas.py          WebSocket message shapes
     scripts/
       test_translate.py   Manual smoke test for /ws/translate
-      test_diarize.py     Manual smoke test for /ws/diarize
+      bench_translate.py  Translation latency benchmark across Groq models
     requirements.txt
     .env.example
   frontend/                PWA: the primary phone client
@@ -35,84 +35,68 @@ Babel/
 
 ## How it works
 
-1. The client opens `wss://<host>/ws/stream?lang=<target>&source_langs=<code1,code2,...>` and starts streaming raw 16kHz mono PCM16 audio chunks (~50ms each), captured via an `AudioWorklet` in the browser (falls back to `ScriptProcessorNode` if unavailable).
-2. FastAPI accepts the client connection and decides how to talk to Deepgram based on the candidate languages (see "Language switching" below): either one `language=multi` connection that auto-switches natively, or one single-language connection that the client can manually re-point.
-3. Deepgram streams back interim and final transcripts. Interim results (`is_final=false`) are relayed to the client immediately, untranslated, for instant visual feedback. The server replies with `{"type": "status", "data": "connected", "multi_mode": bool, "language": "<code>"}` right after connecting, so the client knows whether to show a manual language picker.
-4. Each final segment is pushed onto an internal queue and translated by a dedicated background worker calling Groq with `stream=True`. Translations for different segments are processed in order (so they don't interleave), while STT keeps flowing independently in the meantime.
-5. All server→client messages are structured JSON: `{"type": "transcript", "segment_id": N, "data": "...", "is_final": bool, "language": "<code>"}` and `{"type": "translation", "segment_id": N, "data": "...", "final": bool}` (translation arrives as a stream of deltas, terminated by one `final: true` message with empty `data`).
-6. If speaker separation is turned on, the client opens a second connection to `/ws/diarize` with the same audio and merges the resulting `speaker_turn` events into the transcript by timestamp, client-side.
+1. The client opens `wss://<host>/ws/stream?lang=<target>&source_langs=<code1,code2,...>` and streams raw 16kHz mono PCM16 audio chunks (~50ms each), captured via an `AudioWorklet` in the browser (falls back to `ScriptProcessorNode` if unavailable). One upload, however many languages are selected.
+2. The server plans its Deepgram connections from the candidate languages (see "Language detection" below), opens them in parallel, and broadcasts the client's audio to all of them. `diarize=true` is set on one **anchor** connection, which supplies speaker labels for the whole session.
+3. Deepgram streams back interim and final transcripts. Interims are relayed immediately and untranslated for instant feedback, but only from the currently-active language, so the preview line doesn't flicker between competing transcriptions.
+4. Finalized segments from different connections that cover the same audio are grouped and arbitrated: highest mean per-word confidence wins, with a stickiness bonus for the language currently being spoken. The winning transcript is emitted with a speaker label read from the anchor's word-level timeline.
+5. Each final segment is translated by Groq with `stream=True`. Up to `TRANSLATION_CONCURRENCY` segments translate at once, but a single emitter forwards them **in spoken order**, so a slow response for segment 1 no longer blocks segment 2 from starting while still guaranteeing ordered output.
+6. All server→client messages are structured JSON — see `app/schemas.py` for the exact shapes. Translations arrive as a stream of deltas terminated by one `final: true` message carrying latency measurements.
 
-### Language switching
+### Language detection
 
-Bilingual/multilingual sessions (`source_langs` has more than one code) are handled one of two ways, decided once at connect time by `MULTI_MODE_LANGUAGES` in `app/main.py`:
+Every language you select is detected automatically; there is no toggling in normal use. How that's achieved depends on the languages:
 
-- **Every candidate language is in Deepgram's native code-switching set** (`en`, `es`, `fr`, `de`, `hi`, `ru`, `pt`, `ja`, `it`, `nl` for Nova-3, checked 2026-08) — the whole session connects with `language=multi`, and Deepgram itself detects and transcribes each language correctly without any reconnection. Each transcript message's `language` field comes straight from Deepgram's own per-result `channel.alternatives[0].languages`.
-- **Any candidate language falls outside that set** (Arabic, Turkish, Tagalog, Tamil, ...) — no automatic switching is attempted for the whole session, even for the covered languages in a mixed set. Instead the client sends a `{"type": "switch_language", "language": "<code>"}` text frame whenever the user manually picks a different language, and the server reconnects Deepgram with the new language, replying with `{"type": "status", "data": "language_switched", "language": "<code>"}` once it's live.
+- **Languages in Deepgram's native code-switching set** (`en`, `es`, `fr`, `de`, `hi`, `ru`, `pt`, `ja`, `it`, `nl` for Nova-3, checked 2026-08) share **one** `language=multi` connection. This is the best case: Deepgram resolves mixing *within a single sentence* and tags each word with its own language, which the UI renders inline.
+- **Languages outside that set** (Arabic, Turkish, Tagalog, Tamil, Chinese, Korean) each get their **own parallel connection**. All connections hear the same audio simultaneously, so the correct-language model is always already listening — and each finalized utterance is decided afterwards by comparing confidence.
 
-An earlier version of this attempted automatic switching for *any* language combination by running finalized Deepgram transcripts through `langid.py` and reconnecting on a detected shift. That doesn't work reliably: if the wrong-language connection is still active when a speaker switches, it transcribes the new language using the old one's model, producing garbled text that still reads as the old language to a text classifier — so the switch can never be detected. Native `multi` mode doesn't have this chicken-and-egg problem since Deepgram listens for all its covered languages simultaneously; outside that set there's no substitute, hence the manual picker.
+`STT_CONNECTION_BASELINE` (2) documents what a typical session costs; a session opens as many connections as its languages genuinely need, up to `STT_CONNECTION_CEILING` (4) as a runaway guard. Deepgram bills per open stream, so the Settings panel shows the stream count for a selection before you start.
 
-## `/ws/diarize` and `/ws/translate`
+An earlier version tried to auto-switch a *single* connection by running finalized transcripts through `langid.py` and reconnecting on a detected shift. That can't work: if the wrong-language connection is live when a speaker switches, it transcribes the new language with the old one's model, producing garbled text that still reads as the old language to a text classifier — so the switch is never detected. Running the connections concurrently removes the chicken-and-egg problem entirely, which is the whole reason for the fan-out.
 
-Originally built for the iOS app, both are also usable by (and in the PWA's
-case, actively used by) the web client:
+### Mixed-language sentences
 
-- **`/ws/diarize`** — accepts a raw PCM16 audio stream (same format as
-  `/ws/stream`) and streams back `{"type": "speaker_turn", "speaker": "S1",
-  "start": 12.3, "end": 15.1}` events as `diart` resolves each ~5s analysis
-  window. Independent of `/ws/stream`, so a client can run STT/translation and
-  diarization concurrently over the same audio. See `app/diarization.py` for
-  implementation notes and version caveats. The PWA's diarization toggle
-  (off by default) controls whether it opens this connection at all.
-- **`/ws/translate`** — accepts `{"segment_id", "text", "target_lang"}` JSON
-  requests and streams back translation deltas (same message shape as
-  `/ws/stream`'s translation messages), reusing `translator.py` unchanged.
-  Used by the iOS app when on-device STT already produced text but Apple's
-  on-device `Translation` framework doesn't support the language pair; the
-  PWA doesn't need this since `/ws/stream` already returns translated text.
+Within the code-switching set this is handled natively and well — mix English and Spanish in one sentence and you get one transcript with per-word language tags.
 
-Before wiring a client to a new backend, sanity-check these two directly:
+Across the boundary (Arabic with English words in the same sentence) no single model can do it: a single-language model renders foreign words as phonetic approximations in its own script, and code-switched speech measures 30–50% worse WER than monolingual for exactly this reason. What the app does instead is **dual-hypothesis fusion**. When two connections produce finals for the same audio and their confidence is within `FUSION_MARGIN`, both transcripts go to the translator — one has the Arabic right and the English mangled, the other the reverse — and the model reconstructs what was actually said before translating. A clear winner means monolingual speech, and the runner-up is ignored.
+
+This recovers meaning reliably and wording usually. It will not give you a word-perfect mixed-script transcript; heavily mixed Arabic/English remains the weakest case. Turn it off in Settings to compare.
+
+### Speaker separation
+
+Speaker labels come from Deepgram's own streaming diarizer (`diarize=true`), which assigns a speaker index to every word in the same result that carries the transcript — so there is no timestamp alignment step and no extra latency.
+
+This replaced a `diart`/pyannote sidecar on a second WebSocket. For streaming specifically, Deepgram is the better performer: offline pyannote is ~11% DER on AMI, but online incremental clustering (what diart does) degrades that by 5–10 points, while Deepgram's streaming diarizer reports 8–14% DER. Removing it also removed `torch`, `torchaudio`, `torchvision`, `matplotlib` and a pinned `huggingface_hub` — and with them diart's `numpy<2.0` pin, which was the only thing forcing Python ≤3.12.
+
+Because speaker indices are per-connection and wouldn't agree across languages, exactly one connection is the diarization **anchor**, and every segment's label is read from its timeline. Deepgram's diarization is acoustic, so the anchor's segmentation is valid for an utterance any connection transcribed.
+
+## `/ws/translate`
+
+Accepts `{"segment_id", "text", "target_lang"}` JSON requests and streams back translation deltas (same message shape as `/ws/stream`'s), reusing `translator.py`. For a client that already has transcribed text and just needs a cloud translation; the PWA doesn't need it since `/ws/stream` already returns translated text.
 
 ```bash
 cd backend
 python scripts/test_translate.py "Hello, how are you?" Spanish
-python scripts/test_diarize.py path/to/16k_mono.wav
 ```
 
 ## Setup
 
-**Requirements:** Python 3.11 or 3.12 (**not 3.13** — see below), a Deepgram
-API key, a Groq API key, and (for `/ws/diarize`) a Hugging Face token.
+**Requirements:** Python 3.11+, a Deepgram API key, and a Groq API key. That's
+the whole list — no Hugging Face token, no gated model terms to accept, and no
+`torch` download.
 
 ```bash
 cd backend
-py -3.12 -m venv .venv
+python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Edit `backend/.env` and fill in `DEEPGRAM_API_KEY` and `GROQ_API_KEY`. For
-diarization, also accept the gated models' terms at
-https://huggingface.co/pyannote/segmentation **and**
-https://huggingface.co/pyannote/embedding (diart's actual default pipeline —
-not `pyannote/speaker-diarization-3.1`, despite that being the model most
-pyannote docs point you to), generate a token at
-https://huggingface.co/settings/tokens, and set `HUGGINGFACE_TOKEN`. The
-`diart`/`torch` dependencies are heavy (first run downloads pretrained
-models) and only `/ws/diarize` needs them — the rest of the backend works
-without them installed.
+Edit `backend/.env` and fill in `DEEPGRAM_API_KEY` and `GROQ_API_KEY`.
+Everything else in `.env.example` is optional and documented inline.
 
-**Why Python 3.12, not 3.13:** `diart` pins `numpy<2.0`, and numpy stopped
-publishing prebuilt wheels for the 1.x line before Python 3.13 existed —
-installing on 3.13 tries to compile numpy from source and fails without a C
-compiler. `requirements.txt` also pins `torch`/`torchaudio`/`torchvision`,
-`matplotlib`, and `huggingface_hub` to specific ranges beyond what diart
-itself requires, because their latest releases have each individually
-broken something pyannote.audio 3.4.0 still relies on (removed
-`torchaudio.AudioMetaData`, removed `matplotlib.cm.get_cmap`, removed the
-`use_auth_token` kwarg on `hf_hub_download` respectively) — see the comments
-in `requirements.txt` if a future `pip install` starts failing again in this
-area.
+Speaker separation needs no extra setup: it rides along on the same Deepgram
+connection as the transcript.
 
 ## Run
 
@@ -128,10 +112,10 @@ The backend also serves the frontend directly via `/static`, so no separate stat
 ## Test locally (desktop)
 
 1. Start the server as above and open the page.
-2. Tap the gear icon, pick a target language and the language(s) you'll be speaking, close Settings.
+2. Tap the gear icon, pick a target language and every language you expect to hear, close Settings. The panel shows how many Deepgram streams that selection will open and which translation model it will use.
 3. Click **Start Listening**, grant microphone permission.
-4. Speak — a bubble appears per finalized segment, with the source text filling in first and the translation shortly after (translating… while it's in flight). An italic line above the bubbles shows the current interim (not-yet-final) transcript.
-5. Click **Stop Listening** to close the mic and WebSocket(s) cleanly.
+4. Speak — a bubble appears per finalized segment, tagged with its speaker and language, source text first and translation shortly after. An italic line above the bubbles shows the current interim transcript. Switch languages mid-conversation without touching anything.
+5. Click **Stop Listening** to close the mic and WebSocket cleanly.
 6. `GET /health` returns `{"status": "ok"}` for a quick backend liveness check.
 
 ## Test on your phone
@@ -141,16 +125,18 @@ The backend also serves the frontend directly via `/static`, so no separate stat
 3. On the phone, open Safari to `http://<LAN-IP>:8000/static/index.html`.
 4. Tap **Share → Add to Home Screen** (the app shows a one-time banner reminding you of this, since Safari has no automatic install prompt). Launching from the home screen icon runs it in standalone mode (no browser chrome) and keeps the screen awake while listening (Screen Wake Lock API).
 5. In Settings, the Backend field can stay blank (same-origin) since you loaded the page directly from the backend's address.
-6. Everything else matches the desktop flow above. Speaker separation needs `HUGGINGFACE_TOKEN`/`diart` configured on the backend (see Setup) — the toggle is off by default so the rest of the app works without that setup.
+6. Everything else matches the desktop flow above. Speaker separation is always on and needs no backend setup.
 
 ### Sanity-checking the pipeline pieces independently
 
 - Deepgram connectivity: bad/missing `DEEPGRAM_API_KEY` surfaces as a `{"type": "error", ...}` message immediately on connect (visible in the status pill and browser console).
 - Groq connectivity: a translation failure surfaces as `{"type": "error", "data": "Translation failed: ..."}` without tearing down the transcript stream.
-- Watch server logs (`uvicorn` stdout) — each stage logs on failure with a full traceback.
+- Translation latency: `python scripts/bench_translate.py --target Arabic` measures time-to-first-token per model, including the pre-tuning configuration as a baseline row.
+- Watch server logs (`uvicorn` stdout) — the STT session logs its connection plan and diarization anchor on connect, and each segment logs its translation timings.
 
 ## Notes on the design choices
 
-- **Why a translation queue instead of `asyncio.create_task` per segment:** translating segments fully in parallel would let a slow Groq response for segment 1 finish after segment 2, causing translations to render out of order. A single background worker consuming a queue keeps translations in the order they were spoken while still running fully decoupled from — and non-blocking of — the Deepgram forwarding loop.
+- **Why concurrent translation with an ordered emitter:** translating segments fully in parallel would let a slow response for segment 1 finish after segment 2, rendering them out of order. The previous fix was a single serial worker, which preserved order but also meant segment 2 couldn't *start* until segment 1 had finished streaming. Now each segment translates immediately into its own queue and one emitter drains those queues in segment order — same ordering guarantee, without the head-of-line blocking.
+- **Why `endpointing` is the latency dial that matters:** translation itself now runs in ~50-100ms, so the silence threshold before Deepgram finalizes a segment is most of the perceived wait. Lower is more responsive but fragments sentences across bubbles, and fragments translate worse having lost the rest of the sentence for context. See `ENDPOINTING_MS` in `.env.example`.
 - **Why stride-decimation resampling in the worklet:** it's cheap enough to run per-sample in the audio thread and is sufficient quality for speech STT; it intentionally skips an anti-aliasing filter for simplicity. If you see STT quality issues, that's the first place to upgrade (e.g. a proper polyphase resampler).
-- **Model choice:** `GROQ_MODEL` defaults to `llama-3.1-70b-versatile`; set it to a spec-decoded variant (e.g. `llama-3.3-70b-specdec`) in `.env` for lower per-token latency if your Groq account has access.
+- **Model choice:** `GROQ_MODEL_MODE=auto` picks per session — `llama-3.3-70b-versatile` when every language in play is one it officially supports (en/de/fr/it/pt/hi/es), `openai/gpt-oss-120b` otherwise. That split exists because llama-3.3's official language list covers none of Arabic, Tagalog, Tamil, Chinese, Japanese, Korean or Turkish, while gpt-oss scores 82.7/82.9 on Arabic/Korean MMMLU. gpt-oss is a reasoning model, so it's sent with `reasoning_effort="low"`; measured first-token cost is ~330ms against ~60ms for llama-3.3. Force either with `GROQ_MODEL_MODE=fast|quality` or the Settings panel.

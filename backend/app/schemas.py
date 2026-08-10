@@ -1,8 +1,17 @@
 """Structured JSON message shapes exchanged with the client over WebSockets."""
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel
+
+
+class WordLanguage(BaseModel):
+    """One word and the language Deepgram heard it in. Only populated for
+    `language=multi` connections, where a single sentence can legitimately
+    contain more than one language."""
+
+    word: str
+    language: str
 
 
 class TranscriptMessage(BaseModel):
@@ -10,7 +19,12 @@ class TranscriptMessage(BaseModel):
     segment_id: int
     data: str
     is_final: bool
-    language: str  # active Deepgram source language code at the time this segment arrived
+    language: str  # language of this segment, decided by arbitration (see stt_session)
+    # Speaker index from Deepgram's streaming diarizer, taken from the
+    # session's anchor connection so labels stay consistent across languages.
+    speaker: Optional[int] = None
+    # Present only when one utterance genuinely mixed languages.
+    word_languages: Optional[list[WordLanguage]] = None
 
 
 class TranslationMessage(BaseModel):
@@ -18,21 +32,31 @@ class TranslationMessage(BaseModel):
     segment_id: int
     data: str
     final: bool
+    # Wall-clock milliseconds from Deepgram finalizing the segment to the
+    # first translated token, and to completion. Sent on the final message
+    # so the client can surface real latency instead of guessing at it.
+    ms_to_first_token: Optional[int] = None
+    ms_total: Optional[int] = None
+    # True when this translation was reconstructed from two competing
+    # recognizers (code-switched speech) rather than a single transcript.
+    fused: bool = False
 
 
 class StatusMessage(BaseModel):
     """data is a short human-readable status string in the common case.
 
-    /ws/stream also sends two other shapes on this same "status" type,
-    neither modeled here since these are sent as raw dicts (see main.py's
-    _safe_send_json), not validated against this class:
+    /ws/stream also sends a richer shape on this same "status" type, not
+    modeled here since it's sent as a raw dict (see main.py's
+    _safe_send_json):
       - on connect: {"type": "status", "data": "connected",
-        "multi_mode": bool, "language": "<code>"} -- multi_mode tells the
-        client whether this session auto-switches languages via Deepgram's
-        native code-switching, or needs a manual language picker.
+        "languages": [<code>, ...],      # auto-detected this session
+        "manual_languages": [<code>, ...],  # beyond the connection ceiling
+        "connections": int,              # live Deepgram connections
+        "diarization": bool,             # speaker labels available
+        "model": "<groq model id>"}
       - on a manual switch: {"type": "status", "data": "language_switched",
         "language": "<code>"}, sent after a client "switch_language"
-        control message succeeds (see main.py's switch_to_language).
+        control message succeeds.
     """
 
     type: Literal["status"] = "status"
@@ -44,19 +68,10 @@ class ErrorMessage(BaseModel):
     data: str
 
 
-class SpeakerTurnMessage(BaseModel):
-    """Server -> client, sent on /ws/diarize as diart resolves each window."""
-
-    type: Literal["speaker_turn"] = "speaker_turn"
-    speaker: str
-    start: float
-    end: float
-
-
 class TranslateRequest(BaseModel):
     """Client -> server, sent on /ws/translate for standalone text translation
-    (used when the client already has transcribed text, e.g. from on-device
-    STT, and just needs a cloud translation fallback)."""
+    (used when a client already has transcribed text and just needs a cloud
+    translation)."""
 
     segment_id: int
     text: str
@@ -64,12 +79,15 @@ class TranslateRequest(BaseModel):
 
 
 class SwitchLanguageRequest(BaseModel):
-    """Client -> server, sent as a text frame on /ws/stream to manually
-    switch the active source language. Documented here but not validated
-    against this class in main.py (handle_control_message parses it as a
-    plain dict) -- malformed/unknown values are simply ignored rather than
-    erroring, since a manual switch is a UI action, not a request needing
-    error feedback the way /ws/translate's does."""
+    """Client -> server, sent as a text frame on /ws/stream to manually pick
+    the active source language.
+
+    Only relevant when a session selected more languages than
+    STT_CONNECTION_CEILING allows connections for; in the normal case every
+    selected language is transcribed concurrently and detected automatically,
+    so there is nothing to switch. Documented here but not validated against
+    this class in main.py -- unknown values are ignored rather than erroring,
+    since this is a UI action, not a request needing error feedback."""
 
     type: Literal["switch_language"] = "switch_language"
-    language: str  # must be one of the session's candidate source languages
+    language: str
