@@ -11,6 +11,7 @@ from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
@@ -41,6 +42,10 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
 if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=FRONTEND_DIR, html=True), name="static")
 
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse("/static/index.html")
 
 @app.get("/health")
 async def health():

@@ -2,3 +2,5 @@ backend/.venv*/
 backend/.env
 __pycache__/
 *.pyc
+server.log
+.claude/settings.local.json

@@ -4,8 +4,8 @@
     {
       "name": "babel-backend",
       "runtimeExecutable": "backend/.venv312/Scripts/python.exe",
-      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--port", "8010", "--app-dir", "backend"],
-      "port": 8010
+      "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "backend"],
+      "port": 8000
     }
   ]
 }
