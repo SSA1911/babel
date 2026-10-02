@@ -1,8 +1,35 @@
 # Babel — Real-Time Audio Translator
 
-Low-latency speech-to-speech captioning.
+Low-latency speech-to-speech captioning: speak in one language, read it in another while the conversation is still happening. Mic audio streams to Deepgram (streaming STT with automatic language detection and speaker labels), finalized segments stream through Groq (LLM translation), and captions land in the browser over a single WebSocket. Installable to a phone home screen as a PWA — no app store, no Mac.
 
-- **Web / PWA** (`frontend/`) — the primary client, and the focus of active development. Mic audio → Deepgram Nova-3 (streaming STT, with automatic language detection and speaker labels) → Groq (streaming translation) → browser, over a single `/ws/stream` connection. Installable to an iPhone home screen (manifest + service worker), no app store, no Mac required. See "Run" below for setup and "Test locally" for the on-phone install steps.
+![Babel caption UI — speaker-tagged bubbles with source text, inline language highlighting, and translations](assets/screenshot.png)
+
+*Screenshotted with sample captions (demo data) to show the full UI in one frame; live sessions render the same bubbles from real speech.*
+
+## Quickstart
+
+**Requirements:** Python 3.11+, a Deepgram API key, and a Groq API key. That's the whole list — no Hugging Face token, no gated model terms to accept, and no `torch` download.
+
+```bash
+cd backend
+python -m venv .venv
+.venv\Scripts\activate        # Windows — or: source .venv/bin/activate
+pip install -r requirements.txt
+copy .env.example .env        # fill in DEEPGRAM_API_KEY and GROQ_API_KEY
+```
+
+Then start the server with `run_server.bat` (Windows one-command startup — edit the two paths at the top for your machine; logs to `backend/server.log`) or directly:
+
+```bash
+cd backend
+uvicorn app.main:app --reload --port 8000
+```
+
+Open **http://localhost:8000/** in a desktop browser (needs `getUserMedia` + `AudioWorklet` support, and a secure context — `localhost` counts). The server redirects `/` to the app; the `/static/index.html` path still works. Everything else in `.env.example` is optional and documented inline. Speaker separation needs no extra setup: it rides along on the same Deepgram connection as the transcript.
+
+## Clients
+
+- **Web / PWA** (`frontend/`) — the primary client, and the focus of active development. Mic audio → Deepgram Nova-3 (streaming STT, with automatic language detection and speaker labels) → Groq (streaming translation) → browser, over a single `/ws/stream` connection. Installable to an iPhone home screen (manifest + service worker), no app store, no Mac required. See "Quickstart" above and "Test on your phone" for the on-phone install steps.
 - **iOS native app** (`ios/`) — early scaffolding only, not built or wired to the current backend. The PWA is the cross-platform path; treat `ios/` as reference material until someone picks it up. See [ios/README.md](ios/README.md).
 
 ## Layout
@@ -11,7 +38,7 @@ Low-latency speech-to-speech captioning.
 Babel/
   backend/
     app/
-      main.py             FastAPI app: /ws/stream, /ws/translate
+      main.py             FastAPI app: /ws/stream, /ws/translate, serves the frontend
       stt_session.py      Multi-connection STT: fan-out, arbitration, speaker anchor
       deepgram_client.py  Deepgram live-transcription WebSocket wrapper
       translator.py       Groq streaming translation + model selection
@@ -20,6 +47,7 @@ Babel/
     scripts/
       test_translate.py   Manual smoke test for /ws/translate
       bench_translate.py  Translation latency benchmark across Groq models
+    run_server.bat        One-command Windows startup (logs to backend/server.log)
     requirements.txt
     .env.example
   frontend/                PWA: the primary phone client
@@ -30,6 +58,7 @@ Babel/
   ios/                     Native app: secondary/reference path, needs a Mac
     Babel/                SwiftUI app source (see ios/README.md)
     project.yml            XcodeGen project manifest
+  assets/                  README screenshots
   README.md
 ```
 
@@ -78,37 +107,6 @@ cd backend
 python scripts/test_translate.py "Hello, how are you?" Spanish
 ```
 
-## Setup
-
-**Requirements:** Python 3.11+, a Deepgram API key, and a Groq API key. That's
-the whole list — no Hugging Face token, no gated model terms to accept, and no
-`torch` download.
-
-```bash
-cd backend
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-```
-
-Edit `backend/.env` and fill in `DEEPGRAM_API_KEY` and `GROQ_API_KEY`.
-Everything else in `.env.example` is optional and documented inline.
-
-Speaker separation needs no extra setup: it rides along on the same Deepgram
-connection as the transcript.
-
-## Run
-
-```bash
-cd backend
-uvicorn app.main:app --reload --port 8000
-```
-
-Then open **http://localhost:8000/static/index.html** in a desktop browser (needs `getUserMedia` + `AudioWorklet` support, and a secure context — `localhost` counts) to test on this machine.
-
-The backend also serves the frontend directly via `/static`, so no separate static server is needed. On a phone, the frontend's Settings panel (gear icon) lets you point at a backend running elsewhere (e.g. your dev machine's LAN IP) without editing any files — see "On your phone" below.
-
 ## Test locally (desktop)
 
 1. Start the server as above and open the page.
@@ -121,8 +119,8 @@ The backend also serves the frontend directly via `/static`, so no separate stat
 ## Test on your phone
 
 1. Make sure your phone and the machine running the backend are on the same network, and find that machine's LAN IP (e.g. `ipconfig getifaddr en0` on a Mac, `ipconfig` on Windows).
-2. On the backend machine, run `uvicorn app.main:app --host 0.0.0.0 --port 8000` (note `--host 0.0.0.0` — the default `127.0.0.1` only accepts connections from the same machine) and make sure the OS firewall allows inbound connections on port 8000.
-3. On the phone, open Safari to `http://<LAN-IP>:8000/static/index.html`.
+2. On the backend machine, run `uvicorn app.main:app --host 0.0.0.0 --port 8000` (note `--host 0.0.0.0` — the default `127.0.0.1` only accepts connections from the same machine; `run_server.bat` already does this) and make sure the OS firewall allows inbound connections on port 8000.
+3. On the phone, open Safari to `http://<LAN-IP>:8000/`.
 4. Tap **Share → Add to Home Screen** (the app shows a one-time banner reminding you of this, since Safari has no automatic install prompt). Launching from the home screen icon runs it in standalone mode (no browser chrome) and keeps the screen awake while listening (Screen Wake Lock API).
 5. In Settings, the Backend field can stay blank (same-origin) since you loaded the page directly from the backend's address.
 6. Everything else matches the desktop flow above. Speaker separation is always on and needs no backend setup.
@@ -132,7 +130,7 @@ The backend also serves the frontend directly via `/static`, so no separate stat
 - Deepgram connectivity: bad/missing `DEEPGRAM_API_KEY` surfaces as a `{"type": "error", ...}` message immediately on connect (visible in the status pill and browser console).
 - Groq connectivity: a translation failure surfaces as `{"type": "error", "data": "Translation failed: ..."}` without tearing down the transcript stream.
 - Translation latency: `python scripts/bench_translate.py --target Arabic` measures time-to-first-token per model, including the pre-tuning configuration as a baseline row.
-- Watch server logs (`uvicorn` stdout) — the STT session logs its connection plan and diarization anchor on connect, and each segment logs its translation timings.
+- Watch server logs (`uvicorn` stdout or `backend/server.log` when using `run_server.bat`) — the STT session logs its connection plan and diarization anchor on connect, and each segment logs its translation timings.
 
 ## Notes on the design choices
 
