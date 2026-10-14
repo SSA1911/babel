@@ -18,8 +18,8 @@ class TranslateRequest(BaseModel):
 
     segment_id: int
     text: str = Field(max_length=5000)
-    target_lang: str
+    target_lang: str = Field(max_length=64)
     # Source language of `text`, when the client knows it. Feeds pick_model's
     # coverage check; absent means "unknown" (all([]) -> fast model, which
     # covers every source language Babel supports anyway).
-    source_lang: Optional[str] = None
+    source_lang: Optional[str] = Field(default=None, max_length=64)

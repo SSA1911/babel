@@ -336,24 +336,28 @@ class MultiLanguageSTT:
         )
 
     async def push_audio(self, chunk: bytes) -> None:
-        # Parallel fan-out: a congested socket must not back-pressure the
-        # others. A connection that fails to take the chunk is dead -- drop
-        # it here so it stops costing audio (and so the early-resolve check
-        # in _add_final stops waiting for its hypothesis).
+        # Parallel fan-out: the sends run concurrently, so one slow send can
+        # set per-chunk latency to the slowest of the set, but a connection
+        # that ERRORS no longer blocks or skips the others. A connection that
+        # fails to take the chunk is dead -- drop it here so it stops costing
+        # audio (and so the early-resolve check in _add_final stops waiting
+        # for its hypothesis).
         languages = list(self._clients)
         results = await asyncio.gather(
             *(self._clients[lang].send_audio(chunk) for lang in languages),
             return_exceptions=True,
         )
         for language, result in zip(languages, results):
-            if not isinstance(result, Exception):
+            # BaseException, not Exception: a CancelledError during teardown
+            # must count as dead too (CancelledError is BaseException).
+            if not isinstance(result, BaseException):
                 continue
             logger.warning("Deepgram connection %s is dead; dropping it", language)
             client = self._clients.pop(language, None)
             self._plans = [p for p in self._plans if p.language != language]
             if language == self._anchor_language:
-                # Speaker labels come from the anchor timeline; they end
-                # with the anchor connection.
+                # Without the anchor timeline there are no speaker labels for
+                # new segments; segments still emit, just unlabeled.
                 self._anchor_language = None
             for task in list(self._readers):
                 if task.get_name() == f"dg_reader_{language}":

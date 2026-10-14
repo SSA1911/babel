@@ -803,10 +803,11 @@
       // A failed translation used to leave the "translating…" placeholder up
       // forever; say so instead.
       refs.translationEl.textContent = "(translation failed)";
-      refs.translationEl.classList.remove("pending");
+    } else if (turn.failed) {
+      // Partial stream (died mid-translation) -- don't render as complete.
+      refs.translationEl.textContent = turn.translatedText + " (interrupted)";
     } else {
       refs.translationEl.textContent = turn.translatedText;
-      refs.translationEl.classList.toggle("pending", turn.isFinal && !turn.translatedText);
     }
     refs.langEl.textContent = turn.sourceLocale ? turn.sourceLocale.toUpperCase() : "";
     refs.fusedEl.style.display = turn.fused ? "" : "none";
@@ -1013,11 +1014,8 @@
   function openSocket(url) {
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
-    // Attach both handlers before anything can arrive: the server sends its
-    // "connected" status (languages, stream count, diarization) right after
-    // accepting, while the mic is still warming up. A message that lands
-    // before a handler exists is dropped, not queued; a close before the
-    // handler exists would otherwise strand the session.
+    // Both handlers attach in the same synchronous block as construction, so
+    // no WS event can precede them.
     ws.onmessage = handleStreamMessage;
     ws.onclose = handleStreamClose;
     return ws;
@@ -1027,9 +1025,33 @@
   // re-keyed, so new segment ids can't collide with the old bubbles).
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 3;
+  let reconnectTimer = null;
 
-  function handleStreamClose() {
+  // Any bubble whose translation never finalized (dropped mid-stream, or the
+  // stream died while Groq was still working) gets an honest terminal state
+  // instead of an eternal "translating…" placeholder.
+  function markUnfinishedTurns() {
+    for (const turn of turns.values()) {
+      if (turn.isFinal && !turn.isTranslationFinal) {
+        turn.failed = true;
+        turn.isTranslationFinal = true;
+        renderTurn(turn);
+      }
+    }
+  }
+
+  function handleStreamClose(event) {
+    // Identity check: ignore closes from an orphaned/replaced socket so a
+    // dead old session can't trigger reconnect churn on the live one.
+    if (event.target !== streamWs) return;
     if (!isListening) return;
+    if (event.code === 1008) {
+      // Server auth rejection -- retrying with the same token can't succeed.
+      showError("Access rejected — check the access token in Settings.");
+      stopListening();
+      return;
+    }
+    markUnfinishedTurns();
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       showError("Connection lost repeatedly — stopped.");
       stopListening();
@@ -1037,13 +1059,15 @@
     }
     reconnectAttempts++;
     setStatus(`connection lost — reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`);
-    setTimeout(() => {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
       if (isListening) startListening(true);
     }, 1000 * reconnectAttempts);
   }
 
   async function startListening(resume = false) {
     if (isListening && !resume) return;
+    clearTimeout(reconnectTimer); // cancel any pending stale retry
     toggleBtn.disabled = true;
     clearError();
     setStatus(resume ? "reconnecting…" : "connecting…");
@@ -1089,10 +1113,6 @@
       return;
     }
     mediaStream = stream;
-    // onclose is already assigned in openSocket (before the mic wait, so an
-    // early drop can't strand the session); this reassignment is only here
-    // to override the old per-session closure if one lingered.
-    streamWs.onclose = handleStreamClose;
 
     await requestWakeLock();
 
@@ -1121,6 +1141,12 @@
     toggleBtn.textContent = "Stop Listening";
     toggleBtn.classList.add("listening");
     reconnectAttempts = 0;
+    // A close during the audio-setup awaits above was swallowed by the
+    // (!isListening) guard in handleStreamClose; if it happened, route it
+    // through the same retry path now.
+    if (streamWs.readyState !== WebSocket.OPEN) {
+      handleStreamClose({ target: streamWs, code: 1006 });
+    }
     // No setStatus() here -- the server's "connected" status message (see
     // handleStreamMessage) already set a more specific one (whether this
     // session auto-switches languages or not), and typically arrives before
@@ -1132,11 +1158,13 @@
     cleanupAudio();
     releaseWakeLock();
     if (streamWs && streamWs.readyState === WebSocket.OPEN) streamWs.close();
+    markUnfinishedTurns();
     streamWs = null;
     toggleBtn.disabled = false;
     toggleBtn.textContent = "Start Listening";
     toggleBtn.classList.remove("listening");
     setStatus("stopped");
+    clearTimeout(reconnectTimer); // a queued retry must not fire after a stop
     autoLanguages = [];
     pickerCandidateLangs = [];
     renderLanguagePicker();

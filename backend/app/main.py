@@ -1,5 +1,6 @@
 """FastAPI orchestrator: client audio <-> Deepgram STT <-> Groq translation."""
 
+import secrets
 import asyncio
 import itertools
 import json
@@ -59,7 +60,8 @@ def _ws_authorized(client_ws: WebSocket) -> bool:
     token = settings.babel_ws_token
     if not token:
         return True
-    return client_ws.query_params.get("token", "") == token
+    # compare_digest: constant-time, so response timing can't probe the token.
+    return secrets.compare_digest(client_ws.query_params.get("token", ""), token)
 
 
 def _validated_target_language(raw: str) -> str:
@@ -108,7 +110,10 @@ class _Segment:
 @app.websocket("/ws/stream")
 async def stream_endpoint(client_ws: WebSocket):
     if not _ws_authorized(client_ws):
-        # Closing before accept is a clean 403-style handshake refusal.
+        # accept() first so the browser sees close code 1008 (policy
+        # violation); a pre-accept close becomes a 403 handshake refusal,
+        # which the browser reports as an indistinct 1006.
+        await client_ws.accept()
         await client_ws.close(code=1008)
         logger.warning("Rejected /ws/stream connection: bad or missing token")
         return
@@ -384,7 +389,8 @@ async def translate_endpoint(client_ws: WebSocket):
     without re-uploading audio. A single worker processes requests in order,
     so responses can't interleave."""
     if not _ws_authorized(client_ws):
-        await client_ws.close(code=1008)
+        await client_ws.accept()
+        await client_ws.close(code=1008)  # see /ws/stream for why accept-then-close
         logger.warning("Rejected /ws/translate connection: bad or missing token")
         return
     await client_ws.accept()
@@ -417,11 +423,14 @@ async def translate_endpoint(client_ws: WebSocket):
             if req is None:
                 break
             try:
+                # Validate once, use everywhere: the raw string must never
+                # reach the translator's prompt interpolation.
+                target_lang = _validated_target_language(req.target_lang)
                 model = pick_model(
                     [req.source_lang] if req.source_lang else [],
-                    _validated_target_language(req.target_lang),
+                    target_lang,
                 )
-                async for delta in stream_translation(req.text, req.target_lang, model=model):
+                async for delta in stream_translation(req.text, target_lang, model=model):
                     await _safe_send_json(
                         client_ws,
                         {
