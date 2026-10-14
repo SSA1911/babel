@@ -124,6 +124,15 @@ class PickModelTest(unittest.TestCase):
     def test_mode_quality_pins_quality(self):
         self.assertIn("gpt-oss-120b", pick_model(["en"], "English", "quality"))
 
+    def test_mode_allam_only_in_arabic_lane(self):
+        # Arabic in play + English/Arabic target -> ALLaM.
+        self.assertEqual(pick_model(["ar"], "English", "allam"), "allam-2-7b")
+        self.assertEqual(pick_model(["ar", "en"], "Arabic", "allam"), "allam-2-7b")
+        # Outside the lane (no Arabic, or a third-language target) -> falls
+        # back to auto/qwen instead of failing the session.
+        self.assertIn("qwen", pick_model(["en"], "English", "allam"))
+        self.assertIn("qwen", pick_model(["ar"], "Spanish", "allam"))
+
     def test_unknown_target_falls_back_to_quality(self):
         # Target names come from the validated UI dropdown; an unknown one is
         # out-of-spec, so auto conservatively picks the quality model.

@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # reachable via mode="quality"/.env override. Always sent with
     # reasoning_effort="low" -- see translator.py.
     groq_model_quality: str = "openai/gpt-oss-120b"
+    # SDAIA's Arabic<->English bilingual model, opt-in via mode="allam"
+    # (frontend: "Arabic — allam-2-7b"). pick_model only honors it when
+    # Arabic is in play AND the target is English/Arabic -- it cannot
+    # translate anything else. Probe note (scripts/probe_allam.py,
+    # 2026-10-14): on Khaleeji/Egyptian dialect site talk it left an Arabic
+    # word untranslated and mistranslated نعيد الصب as "celebrate", while
+    # qwen handled the same sentences better -- hence opt-in, not default.
+    groq_model_allam: str = "allam-2-7b"
     target_language: str = "English"
     # Ceiling on a translation response. Segments are single utterances, so
     # this only ever truncates a runaway generation, never real output.

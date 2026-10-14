@@ -63,6 +63,14 @@ def pick_model(source_languages: list[str], target_language: str, mode: Optional
         return settings.groq_model_fast
     if mode == "quality":
         return settings.groq_model_quality
+    if mode == "allam":
+        # ALLaM is strictly Arabic<->English bilingual; outside that lane it
+        # cannot serve, so fall through to auto instead of failing sessions.
+        ar_in_play = "ar" in source_languages
+        target_ok = target_language.strip().lower() in {"english", "arabic"}
+        if ar_in_play and target_ok:
+            return settings.groq_model_allam
+        return pick_model(source_languages, target_language, "auto")
 
     covered = all(code in FAST_MODEL_LANGUAGES for code in source_languages)
     covered = covered and target_language.strip().lower() in FAST_MODEL_LANGUAGE_NAMES

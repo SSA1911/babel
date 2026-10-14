@@ -394,6 +394,7 @@
         <option value="auto">Auto — qwen3.8-27b (recommended)</option>
         <option value="fast">Fast — qwen3.8-27b</option>
         <option value="quality">Backup — gpt-oss-120b (slow, per-language fallback)</option>
+        <option value="allam">Arabic — allam-2-7b (Arabic↔English only, opt-in)</option>
       </select>
       <p class="hint" id="modelHint"></p>
     </div>
@@ -672,6 +673,10 @@
     }
     if (settings.modelMode === "quality") {
       modelHint.textContent = "gpt-oss-120b — backup only (~500ms first token). Use if qwen ever disappoints in a language.";
+      return;
+    }
+    if (settings.modelMode === "allam") {
+      modelHint.textContent = "allam-2-7b — Arabic↔English specialist, opt-in. Probe showed qwen better on Khaleeji/Egyptian dialects; non-Arabic sessions fall back to qwen automatically.";
       return;
     }
     modelHint.textContent = "qwen3.8-27b — best pick for every supported language (verified side-by-side vs gpt-oss-120b).";
