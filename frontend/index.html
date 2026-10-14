@@ -191,7 +191,6 @@
     font-size: 0.85rem;
     font-style: normal;
   }
-  .bubble-translation:empty.pending::before { content: "translating…"; }
 
   #interimRow {
     color: var(--muted);
@@ -377,6 +376,12 @@
     </div>
 
     <div class="settings-section">
+      <label class="field-label" for="authTokenInput">Access token (optional)</label>
+      <input id="authTokenInput" type="password" placeholder="only if the server sets BABEL_WS_TOKEN" autocomplete="off" spellcheck="false" />
+      <p class="hint">Shared secret required by the backend when it runs with BABEL_WS_TOKEN set. Leave blank otherwise.</p>
+    </div>
+
+    <div class="settings-section">
       <label class="field-label" for="targetSelect">Translate into</label>
       <select id="targetSelect"></select>
     </div>
@@ -461,8 +466,7 @@
     const shared = codes.filter((c) => MULTI_MODE_LANGUAGES.has(c));
     const outliers = codes.filter((c) => !MULTI_MODE_LANGUAGES.has(c));
     const groups = [];
-    if (shared.length >= 2) groups.push(shared);
-    else if (shared.length === 1) groups.push(shared);
+    if (shared.length >= 1) groups.push(shared);
     for (const code of outliers) groups.push([code]);
     return {
       auto: groups.slice(0, STT_CONNECTION_CEILING).flat(),
@@ -516,6 +520,7 @@
   const SETTINGS_KEY = "babel.settings";
   const DEFAULT_SETTINGS = {
     backendOrigin: "",
+    authToken: "",
     targetLanguage: "English",
     spokenLanguages: ["en"],
     // auto | fast | quality -- see backend/app/translator.py's pick_model.
@@ -557,6 +562,7 @@
       model_mode: settings.modelMode,
       fusion: settings.fusionEnabled ? "1" : "0",
     });
+    if (settings.authToken) params.set("token", settings.authToken);
     return `${wsBase()}/ws/stream?${params.toString()}`;
   }
 
@@ -573,6 +579,7 @@
   const settingsOverlay = document.getElementById("settingsOverlay");
   const settingsDoneBtn = document.getElementById("settingsDoneBtn");
   const backendInput = document.getElementById("backendInput");
+  const authTokenInput = document.getElementById("authTokenInput");
   const targetSelect = document.getElementById("targetSelect");
   const langChecks = document.getElementById("langChecks");
   const connectionEstimate = document.getElementById("connectionEstimate");
@@ -609,6 +616,7 @@
   // ---------------------------------------------------------------------
   function populateSettingsForm() {
     backendInput.value = settings.backendOrigin;
+    authTokenInput.value = settings.authToken;
     targetSelect.innerHTML = "";
     for (const lang of LANGUAGES) {
       const opt = document.createElement("option");
@@ -691,6 +699,7 @@
     if (e.target === settingsOverlay) settingsOverlay.classList.remove("visible");
   });
   backendInput.addEventListener("change", () => { settings.backendOrigin = backendInput.value; saveSettings(); });
+  authTokenInput.addEventListener("change", () => { settings.authToken = authTokenInput.value.trim(); saveSettings(); });
   targetSelect.addEventListener("change", () => { settings.targetLanguage = targetSelect.value; saveSettings(); renderModelHint(); });
   modelSelect.addEventListener("change", () => { settings.modelMode = modelSelect.value; saveSettings(); renderModelHint(); });
   fusionToggle.addEventListener("change", () => { settings.fusionEnabled = fusionToggle.checked; saveSettings(); });
@@ -790,8 +799,15 @@
     }
 
     renderSource(refs.sourceEl, turn);
-    refs.translationEl.textContent = turn.translatedText;
-    refs.translationEl.classList.toggle("pending", turn.isFinal && !turn.translatedText);
+    if (turn.failed && !turn.translatedText) {
+      // A failed translation used to leave the "translating…" placeholder up
+      // forever; say so instead.
+      refs.translationEl.textContent = "(translation failed)";
+      refs.translationEl.classList.remove("pending");
+    } else {
+      refs.translationEl.textContent = turn.translatedText;
+      refs.translationEl.classList.toggle("pending", turn.isFinal && !turn.translatedText);
+    }
     refs.langEl.textContent = turn.sourceLocale ? turn.sourceLocale.toUpperCase() : "";
     refs.fusedEl.style.display = turn.fused ? "" : "none";
 
@@ -863,8 +879,18 @@
       turn.msToFirstToken = msg.ms_to_first_token ?? null;
       turn.msTotal = msg.ms_total ?? null;
       turn.fused = !!msg.fused;
+      turn.failed = !!msg.failed;
+      renderTurn(turn); // full render once, at the end
+      return;
     }
-    renderTurn(turn);
+    // Hot path: runs on every streamed token. Only touch the translation
+    // line -- renderTurn rebuilds the whole bubble (per-word source spans
+    // included) and that cost is per-token otherwise.
+    const refs = turnElements.get(turn.id);
+    if (refs) {
+      refs.translationEl.textContent = turn.translatedText;
+      scrollToBottom();
+    }
   }
 
   function resetConversation() {
@@ -987,20 +1013,53 @@
   function openSocket(url) {
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
-    // Attach before anything can arrive: the server sends its "connected"
-    // status (languages, stream count, diarization) right after accepting,
-    // while the mic is still warming up. A message that lands before a
-    // handler exists is dropped, not queued.
+    // Attach both handlers before anything can arrive: the server sends its
+    // "connected" status (languages, stream count, diarization) right after
+    // accepting, while the mic is still warming up. A message that lands
+    // before a handler exists is dropped, not queued; a close before the
+    // handler exists would otherwise strand the session.
     ws.onmessage = handleStreamMessage;
+    ws.onclose = handleStreamClose;
     return ws;
   }
 
-  async function startListening() {
-    if (isListening) return;
+  // Bounded auto-reconnect. Transcript history stays in the DOM (maps are
+  // re-keyed, so new segment ids can't collide with the old bubbles).
+  let reconnectAttempts = 0;
+  const MAX_RECONNECT_ATTEMPTS = 3;
+
+  function handleStreamClose() {
+    if (!isListening) return;
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      showError("Connection lost repeatedly — stopped.");
+      stopListening();
+      return;
+    }
+    reconnectAttempts++;
+    setStatus(`connection lost — reconnecting (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`);
+    setTimeout(() => {
+      if (isListening) startListening(true);
+    }, 1000 * reconnectAttempts);
+  }
+
+  async function startListening(resume = false) {
+    if (isListening && !resume) return;
     toggleBtn.disabled = true;
     clearError();
-    setStatus("connecting…");
-    resetConversation();
+    setStatus(resume ? "reconnecting…" : "connecting…");
+    cleanupAudio();
+    if (resume) {
+      // Keep the old bubbles as frozen history; clear the maps so this
+      // session's segment ids (which restart at 1) can't collide with them.
+      turns.clear();
+      turnElements.clear();
+      interimText = "";
+      interimLanguage = null;
+      renderInterim();
+    } else {
+      reconnectAttempts = 0;
+      resetConversation();
+    }
     currentLanguage = settings.spokenLanguages[0] || DEFAULT_SETTINGS.spokenLanguages[0];
 
     // Socket handshake (plus the server's own Deepgram connections) and the
@@ -1017,7 +1076,7 @@
 
     const [opened, stream] = await Promise.all([socketOpen, micReady]);
 
-    if (!opened) {
+    if (!opened || streamWs.readyState !== WebSocket.OPEN) {
       setStatus("connection failed");
       stream?.getTracks().forEach((t) => t.stop());
       toggleBtn.disabled = false;
@@ -1030,7 +1089,10 @@
       return;
     }
     mediaStream = stream;
-    streamWs.onclose = () => { if (isListening) stopListening(); };
+    // onclose is already assigned in openSocket (before the mic wait, so an
+    // early drop can't strand the session); this reassignment is only here
+    // to override the old per-session closure if one lingered.
+    streamWs.onclose = handleStreamClose;
 
     await requestWakeLock();
 
@@ -1058,6 +1120,7 @@
     toggleBtn.disabled = false;
     toggleBtn.textContent = "Stop Listening";
     toggleBtn.classList.add("listening");
+    reconnectAttempts = 0;
     // No setStatus() here -- the server's "connected" status message (see
     // handleStreamMessage) already set a more specific one (whether this
     // session auto-switches languages or not), and typically arrives before

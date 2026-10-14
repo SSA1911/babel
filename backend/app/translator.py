@@ -9,7 +9,10 @@ from .config import settings
 
 logger = logging.getLogger("babel.translator")
 
-_client = AsyncGroq(api_key=settings.groq_api_key)
+_client = AsyncGroq(
+    api_key=settings.groq_api_key,
+    **({"base_url": settings.groq_base_url} if settings.groq_base_url else {}),
+)
 
 # Qwen3.8 is heavily multilingual (Qwen lineage claims 100+ languages) and
 # every source language Babel supports was verified live on 2026-10-14 --

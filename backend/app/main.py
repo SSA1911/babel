@@ -23,7 +23,7 @@ from .stt_session import (
     TranscriptEvent,
     plan_connections,
 )
-from .translator import pick_model, stream_translation
+from .translator import FAST_MODEL_LANGUAGE_NAMES, pick_model, stream_translation
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("babel.main")
@@ -50,6 +50,26 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+def _ws_authorized(client_ws: WebSocket) -> bool:
+    """Optional shared-secret gate. WebSockets are CORS-exempt, so without
+    this any reachable host can open sessions that burn Deepgram + Groq
+    credits. Empty token = open (local/Tailscale dev default)."""
+    token = settings.babel_ws_token
+    if not token:
+        return True
+    return client_ws.query_params.get("token", "") == token
+
+
+def _validated_target_language(raw: str) -> str:
+    """Trust-boundary validation: the target language interpolates into the
+    translator's system prompt, so free-form strings never reach it."""
+    name = raw.strip()
+    if name.lower() in FAST_MODEL_LANGUAGE_NAMES:
+        return name
+    logger.warning("Unrecognized target language %r; falling back to %r", raw, settings.target_language)
+    return settings.target_language
 
 
 def _parse_candidate_languages(client_ws: WebSocket) -> list[str]:
@@ -80,15 +100,23 @@ class _Segment:
     segment_id: int
     deltas: "asyncio.Queue[str | None]" = field(default_factory=asyncio.Queue)
     fused: bool = False
+    failed: bool = False
     t_final: float = 0.0
     t_first_token: Optional[float] = None
 
 
 @app.websocket("/ws/stream")
 async def stream_endpoint(client_ws: WebSocket):
+    if not _ws_authorized(client_ws):
+        # Closing before accept is a clean 403-style handshake refusal.
+        await client_ws.close(code=1008)
+        logger.warning("Rejected /ws/stream connection: bad or missing token")
+        return
     await client_ws.accept()
 
-    target_language = client_ws.query_params.get("lang", settings.target_language)
+    target_language = _validated_target_language(
+        client_ws.query_params.get("lang", settings.target_language)
+    )
     candidate_langs = _parse_candidate_languages(client_ws)
     model_mode = client_ws.query_params.get("model_mode")
     fusion_enabled = client_ws.query_params.get("fusion", "1") != "0"
@@ -136,6 +164,7 @@ async def stream_endpoint(client_ws: WebSocket):
     order_queue: "asyncio.Queue[_Segment | None]" = asyncio.Queue()
     translation_slots = asyncio.Semaphore(settings.translation_concurrency)
     session_ended = asyncio.Event()
+    translate_tasks: set[asyncio.Task] = set()
 
     async def translate_segment(segment: _Segment, text: str, alternate: Optional[str]) -> None:
         try:
@@ -148,6 +177,7 @@ async def stream_endpoint(client_ws: WebSocket):
                     await segment.deltas.put(delta)
         except Exception as exc:
             logger.exception("Translation failed for segment %s", segment.segment_id)
+            segment.failed = True
             await _safe_send_json(
                 client_ws, {"type": "error", "data": f"Translation failed: {exc}"}
             )
@@ -194,6 +224,7 @@ async def stream_endpoint(client_ws: WebSocket):
                     "ms_to_first_token": ttft,
                     "ms_total": total,
                     "fused": segment.fused,
+                    "failed": segment.failed,
                 },
             )
 
@@ -232,10 +263,14 @@ async def stream_endpoint(client_ws: WebSocket):
                     segment_id=seg_id, fused=alternate is not None, t_final=time.monotonic()
                 )
                 await order_queue.put(segment)
-                asyncio.create_task(
+                # Tracked so cleanup can cancel in-flight Groq requests; the
+                # done-callback keeps the set from growing without bound.
+                task = asyncio.create_task(
                     translate_segment(segment, event.text, alternate),
                     name=f"translate_{seg_id}",
                 )
+                translate_tasks.add(task)
+                task.add_done_callback(translate_tasks.discard)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -287,7 +322,9 @@ async def stream_endpoint(client_ws: WebSocket):
         await order_queue.put(None)
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        for task in list(translate_tasks):
+            task.cancel()
+        await asyncio.gather(*tasks, *translate_tasks, return_exceptions=True)
         await _safe_close(client_ws)
         logger.info("Session cleaned up")
 
@@ -346,6 +383,10 @@ async def translate_endpoint(client_ws: WebSocket):
     so a client that already has transcribed text can get a cloud translation
     without re-uploading audio. A single worker processes requests in order,
     so responses can't interleave."""
+    if not _ws_authorized(client_ws):
+        await client_ws.close(code=1008)
+        logger.warning("Rejected /ws/translate connection: bad or missing token")
+        return
     await client_ws.accept()
     await _safe_send_json(client_ws, {"type": "status", "data": "connected"})
 
@@ -376,7 +417,10 @@ async def translate_endpoint(client_ws: WebSocket):
             if req is None:
                 break
             try:
-                model = pick_model([], req.target_lang)
+                model = pick_model(
+                    [req.source_lang] if req.source_lang else [],
+                    _validated_target_language(req.target_lang),
+                )
                 async for delta in stream_translation(req.text, req.target_lang, model=model):
                     await _safe_send_json(
                         client_ws,
@@ -394,10 +438,21 @@ async def translate_endpoint(client_ws: WebSocket):
                         "segment_id": req.segment_id,
                         "data": "",
                         "final": True,
+                        "failed": False,
                     },
                 )
             except Exception as exc:
                 logger.exception("Translation failed for segment %s", req.segment_id)
+                await _safe_send_json(
+                    client_ws,
+                    {
+                        "type": "translation",
+                        "segment_id": req.segment_id,
+                        "data": "",
+                        "final": True,
+                        "failed": True,
+                    },
+                )
                 await _safe_send_json(
                     client_ws, {"type": "error", "data": f"Translation failed: {exc}"}
                 )

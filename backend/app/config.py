@@ -84,6 +84,17 @@ class Settings(BaseSettings):
     # Comma-separated list, or "*" for any origin (fine for local dev).
     cors_origins: str = "*"
 
+    # Optional shared secret for the WebSocket endpoints. Empty = open
+    # (local/Tailscale use). When set, both /ws/stream and /ws/translate
+    # reject any connection whose ?token= doesn't match -- WebSockets are
+    # CORS-exempt, so without this any reachable client can burn Deepgram +
+    # Groq credits (up to 4 streams per session, unbounded sessions).
+    babel_ws_token: str = ""
+
+    # Override to self-host translation (any OpenAI-compatible chat endpoint,
+    # e.g. llama-swap serving Hunyuan-MT-7B). Empty = Groq.
+    groq_base_url: str = ""
+
     # extra="ignore" because pydantic-settings defaults to "forbid", which
     # makes a stale key in someone's .env a hard startup crash. Existing
     # .env files still carry HUGGINGFACE_TOKEN and DIARIZATION_MAX_SPEAKERS

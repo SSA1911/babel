@@ -47,10 +47,6 @@ class DeepgramLiveClient:
     def language(self) -> str:
         return self._language
 
-    @property
-    def diarize(self) -> bool:
-        return self._diarize
-
     async def connect(self) -> None:
         params = {
             "encoding": "linear16",

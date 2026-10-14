@@ -4,6 +4,7 @@ app.stt_session + app.translator. No network, no Deepgram.
 Run from backend/:  .venv312/Scripts/python.exe -m unittest tests.test_stt_session -v
 """
 
+import asyncio
 import unittest
 
 from app.stt_session import (
@@ -114,6 +115,49 @@ class SpeakerRunsTest(unittest.TestCase):
         stt._anchor_language = None
         w = hyp("fr", "salut", start=0.0, end=1.0, words=[{"start": 0.0, "end": 1.0}])
         self.assertIsNone(stt._speaker_runs(w))
+
+
+class PushAudioPruneTest(unittest.TestCase):
+    """push_audio must drop a connection that fails to accept audio, cancel
+    its reader, reset the anchor if it was the anchor, and not touch the
+    healthy connections."""
+
+    def test_dead_connection_is_pruned(self):
+        stt = MultiLanguageSTT("key", "m", plan_connections(["en", "ar"])[0])
+
+        class FakeClient:
+            def __init__(self, ok: bool):
+                self.ok = ok
+                self.closed = False
+
+            async def send_audio(self, chunk: bytes) -> None:
+                if not self.ok:
+                    raise ConnectionError("dead")
+
+            async def close(self) -> None:
+                self.closed = True
+
+        good, bad = FakeClient(True), FakeClient(False)
+        stt._clients = {"en": good, "ar": bad}
+        stt._anchor_language = "ar"
+
+        async def scenario() -> None:
+            async def dead_reader() -> None:
+                await asyncio.sleep(100)
+
+            reader = asyncio.create_task(dead_reader(), name="dg_reader_ar")
+            stt._readers = [reader]
+            await stt.push_audio(b"chunk")
+            await asyncio.sleep(0)  # let task.cancel() land
+
+            self.assertEqual(list(stt._clients), ["en"])
+            self.assertTrue(bad.closed)
+            self.assertIsNone(stt._anchor_language)
+            self.assertTrue(reader.done())
+            self.assertEqual([p.language for p in stt._plans], ["en"])
+            self.assertFalse(good.closed)
+
+        asyncio.run(scenario())
 
 
 class PickModelTest(unittest.TestCase):

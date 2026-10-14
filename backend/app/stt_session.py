@@ -215,10 +215,6 @@ class MultiLanguageSTT:
         return len(self._clients)
 
     @property
-    def current_language(self) -> str:
-        return self._current_language
-
-    @property
     def auto_languages(self) -> list[str]:
         return [code for plan in self._plans for code in plan.covers]
 
@@ -340,13 +336,31 @@ class MultiLanguageSTT:
         )
 
     async def push_audio(self, chunk: bytes) -> None:
-        for language, client in list(self._clients.items()):
-            try:
-                await client.send_audio(chunk)
-            except Exception:
-                # One dead connection shouldn't stop the others from hearing
-                # the rest of the conversation.
-                logger.debug("Dropped audio chunk for %s", language)
+        # Parallel fan-out: a congested socket must not back-pressure the
+        # others. A connection that fails to take the chunk is dead -- drop
+        # it here so it stops costing audio (and so the early-resolve check
+        # in _add_final stops waiting for its hypothesis).
+        languages = list(self._clients)
+        results = await asyncio.gather(
+            *(self._clients[lang].send_audio(chunk) for lang in languages),
+            return_exceptions=True,
+        )
+        for language, result in zip(languages, results):
+            if not isinstance(result, Exception):
+                continue
+            logger.warning("Deepgram connection %s is dead; dropping it", language)
+            client = self._clients.pop(language, None)
+            self._plans = [p for p in self._plans if p.language != language]
+            if language == self._anchor_language:
+                # Speaker labels come from the anchor timeline; they end
+                # with the anchor connection.
+                self._anchor_language = None
+            for task in list(self._readers):
+                if task.get_name() == f"dg_reader_{language}":
+                    task.cancel()
+                    self._readers.remove(task)
+            if client is not None:
+                await client.close()
 
     async def finalize(self) -> None:
         await asyncio.gather(
@@ -526,19 +540,20 @@ class MultiLanguageSTT:
             self._windows.remove(window)
         await self._emit(window)
 
-    def _score(self, hypothesis: Hypothesis) -> float:
+    def _base_confidence(self, hypothesis: Hypothesis) -> float:
         confidences = [
             float(w["confidence"]) for w in hypothesis.words if w.get("confidence") is not None
         ]
-        base = statistics.fmean(confidences) if confidences else hypothesis.confidence
+        return statistics.fmean(confidences) if confidences else hypothesis.confidence
 
-        bonus = 0.0
+    def _score(self, hypothesis: Hypothesis) -> float:
+        score = self._base_confidence(hypothesis)
         plan = next((p for p in self._plans if p.language == hypothesis.language), None)
         if plan and self._current_language in plan.covers:
-            bonus = STICKINESS_BONUS
+            score += STICKINESS_BONUS
             if hypothesis.word_count <= SHORT_SEGMENT_WORDS:
-                bonus *= SHORT_SEGMENT_STICKINESS_MULTIPLIER
-        return base + bonus
+                score += STICKINESS_BONUS * (SHORT_SEGMENT_STICKINESS_MULTIPLIER - 1)
+        return score
 
     async def _emit(self, window: _Window) -> None:
         if not window.hypotheses:
@@ -546,7 +561,15 @@ class MultiLanguageSTT:
         ranked = sorted(window.hypotheses.values(), key=self._score, reverse=True)
         winner = ranked[0]
         runner_up = ranked[1] if len(ranked) > 1 else None
-        margin = (self._score(winner) - self._score(runner_up)) if runner_up else 1.0
+        # Raw confidence gap, deliberately excluding the stickiness bonus:
+        # the bonus (which biases the RANKING toward the incumbent language)
+        # would otherwise inflate margin and gate fusion off exactly on
+        # incumbent-language near-ties -- the code-switch signature.
+        margin = (
+            (self._base_confidence(winner) - self._base_confidence(runner_up))
+            if runner_up
+            else 1.0
+        )
 
         self._current_language = winner.detected_language
 
