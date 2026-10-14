@@ -22,12 +22,14 @@ class Settings(BaseSettings):
     # llama-3.3 officially supports, the quality model otherwise. "fast" and
     # "quality" pin one regardless. The client can override per session.
     groq_model_mode: str = "auto"
-    # Non-reasoning, ~280 tok/s, no reasoning preamble before the first
-    # visible token. Officially covers en/de/fr/it/pt/hi/es/th only.
-    groq_model_fast: str = "llama-3.3-70b-versatile"
-    # Reasoning model, but the only option here with credible quality on
-    # Arabic/Tamil/Tagalog/CJK (MMMLU: 82.7 Arabic, 82.9 Korean, 81.3 avg).
-    # Always sent with reasoning_effort="low" -- see translator.py.
+    # Non-reasoning, multilingual (Qwen3.8 lineage), 31-188ms first token on
+    # live probes 2026-10-14 -- covers every source language Babel supports,
+    # which llama-3.3-70b-versatile did not (and that model is now retired
+    # from Groq entirely; it 404s since 2026-08).
+    groq_model_fast: str = "qwen/qwen3.8-27b"
+    # Reasoning fallback for when the fast model's quality in a language is
+    # judged insufficient. Always sent with reasoning_effort="low" -- see
+    # translator.py.
     groq_model_quality: str = "openai/gpt-oss-120b"
     target_language: str = "English"
     # Ceiling on a translation response. Segments are single utterances, so

@@ -275,8 +275,10 @@ class MultiLanguageSTT:
 
     def _choose_anchor(self) -> ConnectionPlan:
         """Diarization runs on exactly one connection. Prefer a
-        single-language one: `diarize` combined with `language=multi` is not a
-        documented combination, so avoid relying on it when there's a choice."""
+        single-language one (labels proven on that path); `diarize` +
+        `language=multi` IS accepted by Deepgram and returns per-word speaker
+        tags (verified live 2026-10-14), so an all-multi session keeps its
+        labels too -- the no-diarize fallback below stays as a guard."""
         for plan in self._plans:
             if not plan.is_multi:
                 return plan
@@ -499,6 +501,20 @@ class MultiLanguageSTT:
             if existing is None or len(hypothesis.text) > len(existing.text):
                 window.hypotheses[hypothesis.language] = hypothesis
 
+            # Every live connection has now finalized this utterance -- no
+            # further hypothesis can arrive for it, so don't pay the full
+            # grace delay. (The grace still bounds the case where a connection
+            # is slow or its final never comes.)
+            complete = len(window.hypotheses) >= len(self._clients)
+            if complete:
+                if window.timer is not None:
+                    window.timer.cancel()
+                    window.timer = None
+                self._windows.remove(window)
+
+        if complete:
+            await self._emit(window)
+
     async def _resolve_after_grace(self, window: _Window) -> None:
         try:
             await asyncio.sleep(self._grace)
@@ -534,19 +550,96 @@ class MultiLanguageSTT:
 
         self._current_language = winner.detected_language
 
-        await self._events.put(
-            TranscriptEvent(
-                is_final=True,
-                text=winner.text,
-                language=winner.detected_language,
-                start=winner.start,
-                end=winner.end,
-                speaker=self._speaker_for(winner),
-                word_languages=self._word_languages(winner),
-                runner_up=runner_up,
-                margin=margin,
+        # Two people talking over each other inside one finalized utterance:
+        # split it into consecutive same-speaker runs so each turn renders as
+        # its own bubble with its own translation, instead of one bubble
+        # stamped with whoever spoke the most. Runs are NOT merged across the
+        # diarizer's flicker on short words -- a one-word interjection bubble
+        # is a better artifact than a mid-sentence mislabel.
+        runs = self._speaker_runs(winner)
+        if runs is None:
+            await self._events.put(
+                TranscriptEvent(
+                    is_final=True,
+                    text=winner.text,
+                    language=winner.detected_language,
+                    start=winner.start,
+                    end=winner.end,
+                    speaker=self._speaker_for(winner),
+                    word_languages=self._word_languages(winner.words, winner.language),
+                    runner_up=runner_up,
+                    margin=margin,
+                )
             )
-        )
+            return
+
+        for speaker, words in runs:
+            text = " ".join(
+                w.get("punctuated_word") or w.get("word", "") for w in words
+            ).strip()
+            if not text:
+                continue
+            try:
+                start, end = float(words[0]["start"]), float(words[-1]["end"])
+            except (KeyError, TypeError, ValueError):
+                start, end = winner.start, winner.end
+            await self._events.put(
+                TranscriptEvent(
+                    is_final=True,
+                    text=text,
+                    language=winner.detected_language,
+                    start=start,
+                    end=end,
+                    speaker=speaker,
+                    # Fusion pairs a runner-up with the FULL utterance; a run
+                    # is a fragment of it, so fusion is skipped for splits.
+                    word_languages=self._word_languages(words, winner.language),
+                )
+            )
+
+    def _speaker_runs(self, winner: Hypothesis) -> Optional[list[tuple[int, list[dict]]]]:
+        """Per-word speaker labels for the winner, grouped into consecutive
+        same-speaker runs, or None when diarization is unavailable or the
+        utterance is single-speaker.
+
+        When the winner is the anchor (or the diarized multi connection) its
+        own words carry speaker tags; otherwise each word is mapped onto the
+        anchor's speaker timeline by overlap, same as _speaker_for but per
+        word instead of per utterance."""
+        if not self.diarization_enabled:
+            return None
+        labels: list[tuple[dict, Optional[int]]] = []
+        if winner.language == self._anchor_language:
+            labels = [(w, w.get("speaker")) for w in winner.words]
+        else:
+            for w in winner.words:
+                try:
+                    labels.append((w, self._speaker_at(float(w["start"]), float(w["end"]))))
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        runs: list[tuple[int, list[dict]]] = []
+        for word, speaker in labels:
+            if speaker is None:
+                continue
+            if runs and runs[-1][0] == speaker:
+                runs[-1][1].append(word)
+            else:
+                runs.append((speaker, [word]))
+        if len({speaker for speaker, _ in runs}) < 2:
+            return None
+        return runs
+
+    def _speaker_at(self, start: float, end: float) -> Optional[int]:
+        """The anchor speaker holding the most of [start, end]."""
+        overlap: dict[int, float] = {}
+        for t_start, t_end, speaker in self._speaker_timeline:
+            intersection = min(t_end, end) - max(t_start, start)
+            if intersection > 0:
+                overlap[speaker] = overlap.get(speaker, 0.0) + intersection
+        if not overlap:
+            return None
+        return max(overlap, key=overlap.get)
 
     def _speaker_for(self, hypothesis: Hypothesis) -> Optional[int]:
         """The speaker who holds the most of this utterance's duration.
@@ -579,15 +672,15 @@ class MultiLanguageSTT:
         return max(overlap, key=overlap.get)
 
     @staticmethod
-    def _word_languages(hypothesis: Hypothesis) -> Optional[list[dict]]:
+    def _word_languages(words: list[dict], language: str) -> Optional[list[dict]]:
         """Per-word language tags, present only on multi connections. This is
         what lets a single mixed-language sentence render with its real
         breakdown instead of one label for the whole utterance."""
-        if hypothesis.language != "multi":
+        if language != "multi":
             return None
         tagged = [
             {"word": w.get("punctuated_word") or w.get("word", ""), "language": w["language"]}
-            for w in hypothesis.words
+            for w in words
             if w.get("language")
         ]
         if not tagged or len({t["language"] for t in tagged}) < 2:

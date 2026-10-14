@@ -263,8 +263,13 @@ async def stream_endpoint(client_ws: WebSocket):
             logger.exception("Error in client reader")
         finally:
             # Flush whatever Deepgram is still holding so the last utterance
-            # isn't lost waiting out the endpointing window.
+            # isn't lost waiting out the endpointing window, then give the
+            # flushed finals time to flow: arrive -> arbitrate (250ms grace)
+            # -> translate -> emit, all before session_ended tears the STT
+            # session down. close() drops pending windows, so this wait is
+            # the only thing standing between the flush and a lost utterance.
             await stt.finalize()
+            await asyncio.sleep(1.0)
             session_ended.set()
 
     tasks = [

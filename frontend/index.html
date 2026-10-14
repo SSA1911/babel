@@ -391,9 +391,9 @@
     <div class="settings-section">
       <label class="field-label" for="modelSelect">Translation model</label>
       <select id="modelSelect">
-        <option value="auto">Auto — match the languages in use</option>
-        <option value="fast">Fast — llama-3.3-70b</option>
-        <option value="quality">Quality — gpt-oss-120b</option>
+        <option value="auto">Auto — qwen3.8-27b for everything</option>
+        <option value="fast">Fast — qwen3.8-27b</option>
+        <option value="quality">Quality — gpt-oss-120b (slow, fallback)</option>
       </select>
       <p class="hint" id="modelHint"></p>
     </div>
@@ -661,21 +661,19 @@
     connectionEstimate.textContent = text;
   }
 
-  // Mirrors pick_model() in backend/app/translator.py.
-  const FAST_MODEL_LANGUAGES = new Set(["en", "de", "fr", "it", "pt", "hi", "es", "th"]);
+  // Mirrors pick_model() in backend/app/translator.py. The fast model
+  // (qwen3.8-27b) covers every source language Babel supports, so "auto"
+  // always picks it; "quality" (gpt-oss-120b) is the manual fallback.
   function renderModelHint() {
     if (settings.modelMode === "fast") {
-      modelHint.textContent = "Fastest to first word, but only covers English, German, French, Italian, Portuguese, Hindi and Spanish well.";
+      modelHint.textContent = "qwen3.8-27b — fastest to the first word, covers all supported languages.";
       return;
     }
     if (settings.modelMode === "quality") {
-      modelHint.textContent = "Best coverage for Arabic, Tagalog, Tamil, Chinese, Japanese, Korean and Turkish. Slightly slower to the first word.";
+      modelHint.textContent = "gpt-oss-120b — reasoning model, slower to the first word (~500ms). Manual fallback.";
       return;
     }
-    const outliers = settings.spokenLanguages.filter((c) => !FAST_MODEL_LANGUAGES.has(c));
-    modelHint.textContent = outliers.length
-      ? `Will use gpt-oss-120b — ${outliers.map(languageName).join(", ")} ${outliers.length === 1 ? "is" : "are"} outside llama-3.3's supported languages.`
-      : "Will use llama-3.3-70b — every selected language is one it supports, so you get the faster model.";
+    modelHint.textContent = "qwen3.8-27b — covers every supported language. Switch to quality only if a translation disappoints.";
   }
 
   settingsBtn.addEventListener("click", () => {
@@ -801,7 +799,10 @@
 
     if (settings.showTimings && turn.msTotal != null) {
       refs.timingEl.textContent = `first word ${turn.msToFirstToken ?? "?"}ms · complete ${turn.msTotal}ms`;
-      refs.timingEl.style.display = "";
+      // Must set a real value: "" clears the inline style, and the
+      // stylesheet's .bubble-timing { display: none } then wins, so the row
+      // stays invisible no matter what the toggle says.
+      refs.timingEl.style.display = "block";
     } else {
       refs.timingEl.style.display = "none";
     }
@@ -980,6 +981,11 @@
   function openSocket(url) {
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
+    // Attach before anything can arrive: the server sends its "connected"
+    // status (languages, stream count, diarization) right after accepting,
+    // while the mic is still warming up. A message that lands before a
+    // handler exists is dropped, not queued.
+    ws.onmessage = handleStreamMessage;
     return ws;
   }
 
@@ -1018,7 +1024,6 @@
       return;
     }
     mediaStream = stream;
-    streamWs.onmessage = handleStreamMessage;
     streamWs.onclose = () => { if (isListening) stopListening(); };
 
     await requestWakeLock();

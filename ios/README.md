@@ -1,5 +1,14 @@
 # Babel iOS — native hybrid client
 
+> **FROZEN as a future fork (2026-10-14).** This tree predates the backend's
+> multi-connection refactor and has drifted: it calls `/ws/diarize`, which
+> the backend no longer exposes (speaker labels now ride on the transcript
+> message), and it speaks the old single-`source_lang` protocol. Kept
+> verbatim on purpose — the planned native rewrite will use iOS-native
+> capabilities (mic AVAudioEngine tuning, Apple Translate app
+> on-device phrase data) rather than being patched forward. Don't build
+> from this tree against the current backend without a protocol resync.
+>
 > **This is a secondary/reference path.** Building it requires Xcode on
 > macOS (or a cloud Mac/CI service) — if you don't have Mac access, use the
 > PWA in [`../frontend/`](../frontend/index.html) instead, which now covers

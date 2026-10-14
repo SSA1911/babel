@@ -3,7 +3,6 @@ uvicorn[standard]>=0.30,<1.0
 websockets>=13,<14
 groq>=0.11,<1.0
 pydantic-settings>=2.4,<3.0
-python-dotenv>=1.0,<2.0
 
 # Speaker diarization is handled by Deepgram's own streaming diarizer
 # (diarize=true on the STT connection -- see app/deepgram_client.py), which

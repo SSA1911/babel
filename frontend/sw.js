@@ -3,7 +3,7 @@
 // normally while online instead of getting stuck behind a stale cache --
 // bump CACHE_VERSION when the app shell files change so old entries get
 // evicted on the next activate.
-const CACHE_VERSION = "babel-v2";
+const CACHE_VERSION = "babel-v3";
 const APP_SHELL = [
   "./",
   "./index.html",

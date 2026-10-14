@@ -11,12 +11,17 @@ logger = logging.getLogger("babel.translator")
 
 _client = AsyncGroq(api_key=settings.groq_api_key)
 
-# Languages llama-3.3 officially supports. Everything else in Babel's source
-# list -- Arabic, Tagalog, Tamil, Chinese, Japanese, Korean, Turkish -- falls
-# outside it, which is what the quality model exists for.
-FAST_MODEL_LANGUAGES = {"en", "de", "fr", "it", "pt", "hi", "es", "th"}
+# Qwen3.8 is heavily multilingual (Qwen lineage claims 100+ languages) and
+# every source language Babel supports was verified live on 2026-10-14 --
+# including Arabic -> English and Tagalog -> English at 31-188ms first token.
+# Kept as an explicit set so a future model swap narrows it deliberately
+# instead of silently.
+FAST_MODEL_LANGUAGES = {
+    "en", "es", "fr", "de", "zh", "ja", "ko", "pt", "hi", "ar", "tr", "tl", "ta",
+}
 FAST_MODEL_LANGUAGE_NAMES = {
-    "english", "german", "french", "italian", "portuguese", "hindi", "spanish", "thai",
+    "english", "spanish", "french", "german", "mandarin chinese", "japanese",
+    "korean", "portuguese", "hindi", "arabic", "turkish", "tagalog", "tamil",
 }
 
 # Kept short on purpose: every token here is prefill on every single segment,
@@ -47,11 +52,11 @@ FUSION_SYSTEM_PROMPT = (
 def pick_model(source_languages: list[str], target_language: str, mode: Optional[str] = None) -> str:
     """Chooses a Groq model for a session.
 
-    "auto" uses the fast (non-reasoning) model only when every language in
-    play is one it officially supports, because that model's coverage stops
-    well short of Babel's source list. Anything involving Arabic, Tagalog,
-    Tamil or CJK gets the quality model instead -- it is slower to first
-    token, but the fast model's output in those languages isn't worth having.
+    "auto" now routes everything to the fast model: qwen3.8-27b translates
+    every source language Babel supports (verified live 2026-10-14: Arabic,
+    Tagalog, Spanish round-trips at 31-188ms first token). The quality model
+    stays available via mode="quality" or .env override, and remains the
+    fallback if the fast set is ever narrowed again.
     """
     mode = (mode or settings.groq_model_mode or "auto").lower()
     if mode == "fast":
