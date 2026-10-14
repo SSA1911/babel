@@ -391,9 +391,9 @@
     <div class="settings-section">
       <label class="field-label" for="modelSelect">Translation model</label>
       <select id="modelSelect">
-        <option value="auto">Auto — qwen3.8-27b for everything</option>
+        <option value="auto">Auto — qwen3.8-27b (recommended)</option>
         <option value="fast">Fast — qwen3.8-27b</option>
-        <option value="quality">Quality — gpt-oss-120b (slow, fallback)</option>
+        <option value="quality">Backup — gpt-oss-120b (slow, per-language fallback)</option>
       </select>
       <p class="hint" id="modelHint"></p>
     </div>
@@ -661,19 +661,20 @@
     connectionEstimate.textContent = text;
   }
 
-  // Mirrors pick_model() in backend/app/translator.py. The fast model
-  // (qwen3.8-27b) covers every source language Babel supports, so "auto"
-  // always picks it; "quality" (gpt-oss-120b) is the manual fallback.
+  // Mirrors pick_model() in backend/app/translator.py. qwen3.8-27b verified
+  // equal-or-better than gpt-oss-120b on every Babel source language
+  // (2026-10-14 side-by-side probe), at ~4x lower first-token latency, so
+  // auto/fast are both qwen; gpt-oss-120b stays as the manual backup only.
   function renderModelHint() {
     if (settings.modelMode === "fast") {
-      modelHint.textContent = "qwen3.8-27b — fastest to the first word, covers all supported languages.";
+      modelHint.textContent = "qwen3.8-27b — same model as Auto, pinned regardless of session languages.";
       return;
     }
     if (settings.modelMode === "quality") {
-      modelHint.textContent = "gpt-oss-120b — reasoning model, slower to the first word (~500ms). Manual fallback.";
+      modelHint.textContent = "gpt-oss-120b — backup only (~500ms first token). Use if qwen ever disappoints in a language.";
       return;
     }
-    modelHint.textContent = "qwen3.8-27b — covers every supported language. Switch to quality only if a translation disappoints.";
+    modelHint.textContent = "qwen3.8-27b — best pick for every supported language (verified side-by-side vs gpt-oss-120b).";
   }
 
   settingsBtn.addEventListener("click", () => {

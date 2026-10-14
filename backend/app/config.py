@@ -27,9 +27,10 @@ class Settings(BaseSettings):
     # which llama-3.3-70b-versatile did not (and that model is now retired
     # from Groq entirely; it 404s since 2026-08).
     groq_model_fast: str = "qwen/qwen3.8-27b"
-    # Reasoning fallback for when the fast model's quality in a language is
-    # judged insufficient. Always sent with reasoning_effort="low" -- see
-    # translator.py.
+    # Reasoning BACKUP model -- qwen3.8-27b matched or beat it on every
+    # source language in the 2026-10-14 side-by-side probe, so it's only
+    # reachable via mode="quality"/.env override. Always sent with
+    # reasoning_effort="low" -- see translator.py.
     groq_model_quality: str = "openai/gpt-oss-120b"
     target_language: str = "English"
     # Ceiling on a translation response. Segments are single utterances, so
